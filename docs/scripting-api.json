@@ -1,0 +1,256 @@
+{
+  "language": "sb-script-lua",
+  "version": 1,
+  "globals": [
+    {
+      "name": "Automation",
+      "kind": "global",
+      "signature": "Automation(name, spec, fn)",
+      "description": "Defines the entrypoint for one automation activation. The name must match the saved definition name when the automation is started.",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "description": "Definition name for this automation.",
+          "required": true
+        },
+        {
+          "name": "spec",
+          "type": "AutomationSpec",
+          "description": "Trigger and target configuration.",
+          "required": true,
+          "fields": [
+            {
+              "name": "trigger",
+              "type": "TriggerSpec",
+              "description": "Required trigger for the automation.",
+              "required": true
+            },
+            {
+              "name": "targets",
+              "type": "TargetSpec",
+              "description": "Default target set. Omit or use None() when targets are resolved inside the callback."
+            }
+          ]
+        },
+        {
+          "name": "fn",
+          "type": "function(ctx)",
+          "description": "Callback executed when the activation fires.",
+          "required": true
+        }
+      ],
+      "examples": [
+        "cmd/sb-script/features/party_time.lua",
+        "cmd/sb-script/features/motion_lights.lua"
+      ]
+    },
+    {
+      "name": "Entity",
+      "kind": "global",
+      "signature": "Entity(key)",
+      "description": "Creates an entity trigger or target spec that matches one exact entity key.",
+      "params": [
+        {
+          "name": "key",
+          "type": "string",
+          "description": "Full entity key such as plugin.device.entity.",
+          "required": true
+        }
+      ],
+      "returns": "TriggerSpec|TargetSpec",
+      "examples": [
+        "cmd/sb-script/features/doorbell.lua"
+      ]
+    },
+    {
+      "name": "Query",
+      "kind": "global",
+      "signature": "Query(query)",
+      "description": "Creates a query-backed trigger or target spec. Queries are re-resolved at fire time.",
+      "params": [
+        {
+          "name": "query",
+          "type": "string",
+          "description": "Storage search key pattern or filter query.",
+          "required": true
+        }
+      ],
+      "returns": "TriggerSpec|TargetSpec",
+      "examples": [
+        "cmd/sb-script/features/motion_lights.lua",
+        "cmd/sb-script/features/party_time.lua"
+      ]
+    },
+    {
+      "name": "None",
+      "kind": "global",
+      "signature": "None()",
+      "description": "Creates an empty target spec for automations that resolve targets inside the callback.",
+      "returns": "TargetSpec",
+      "examples": [
+        "cmd/sb-script/features/doorbell.lua"
+      ]
+    },
+    {
+      "name": "Interval",
+      "kind": "global",
+      "signature": "Interval(seconds | {min=seconds, max=seconds})",
+      "description": "Creates an interval trigger. The runtime clamps intervals below 50ms to 50ms.",
+      "params": [
+        {
+          "name": "seconds",
+          "type": "number",
+          "description": "Fixed interval in seconds."
+        },
+        {
+          "name": "min",
+          "type": "number",
+          "description": "Minimum interval in seconds when using a range."
+        },
+        {
+          "name": "max",
+          "type": "number",
+          "description": "Maximum interval in seconds when using a range."
+        }
+      ],
+      "returns": "TriggerSpec",
+      "examples": [
+        "cmd/sb-script/features/party_time.lua"
+      ]
+    }
+  ],
+  "context_methods": [
+    {
+      "name": "targets:each",
+      "kind": "context_method",
+      "signature": "ctx.targets:each(fn)",
+      "description": "Iterates the current target entities for the activation firing.",
+      "params": [
+        {
+          "name": "fn",
+          "type": "function(entity)",
+          "description": "Called for each target entity.",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "ctx.send",
+      "kind": "context_method",
+      "signature": "ctx.send(entity, action, payload)",
+      "description": "Publishes a command subject for the given entity.",
+      "params": [
+        {
+          "name": "entity",
+          "type": "entity",
+          "description": "Entity table returned by Query/Entity/ctx.targets.",
+          "required": true
+        },
+        {
+          "name": "action",
+          "type": "string",
+          "description": "Command action name.",
+          "required": true
+        },
+        {
+          "name": "payload",
+          "type": "table",
+          "description": "JSON-serializable command body."
+        }
+      ]
+    },
+    {
+      "name": "ctx.query",
+      "kind": "context_method",
+      "signature": "ctx.query(query)",
+      "description": "Resolves entities from storage inside the callback.",
+      "params": [
+        {
+          "name": "query",
+          "type": "string",
+          "description": "Storage search key pattern or filter query.",
+          "required": true
+        }
+      ],
+      "returns": "entities"
+    },
+    {
+      "name": "ctx.queryOne",
+      "kind": "context_method",
+      "signature": "ctx.queryOne(query)",
+      "description": "Returns the first entity matching the query or nil.",
+      "params": [
+        {
+          "name": "query",
+          "type": "string",
+          "description": "Storage search key pattern or filter query.",
+          "required": true
+        }
+      ],
+      "returns": "entity|nil"
+    },
+    {
+      "name": "ctx.after",
+      "kind": "context_method",
+      "signature": "ctx.after(seconds, fn)",
+      "description": "Schedules a one-shot timer owned by the activation.",
+      "params": [
+        {
+          "name": "seconds",
+          "type": "number",
+          "description": "Delay in seconds.",
+          "required": true
+        },
+        {
+          "name": "fn",
+          "type": "function(ctx)",
+          "description": "Callback invoked after the delay.",
+          "required": true
+        }
+      ],
+      "returns": "timer_id",
+      "examples": [
+        "cmd/sb-script/features/fade_up.lua"
+      ]
+    },
+    {
+      "name": "ctx.every",
+      "kind": "context_method",
+      "signature": "ctx.every(seconds, fn)",
+      "description": "Schedules a repeating timer owned by the activation.",
+      "params": [
+        {
+          "name": "seconds",
+          "type": "number",
+          "description": "Repeat interval in seconds.",
+          "required": true
+        },
+        {
+          "name": "fn",
+          "type": "function(ctx)",
+          "description": "Callback invoked for each tick.",
+          "required": true
+        }
+      ],
+      "returns": "timer_id",
+      "examples": [
+        "cmd/sb-script/features/fade_down.lua"
+      ]
+    },
+    {
+      "name": "ctx.cancel",
+      "kind": "context_method",
+      "signature": "ctx.cancel(timer_id)",
+      "description": "Cancels a timer created by ctx.after or ctx.every.",
+      "params": [
+        {
+          "name": "timer_id",
+          "type": "number",
+          "description": "Timer identifier previously returned by ctx.after or ctx.every.",
+          "required": true
+        }
+      ]
+    }
+  ]
+}
