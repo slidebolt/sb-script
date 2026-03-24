@@ -5,12 +5,12 @@ import (
 	"testing"
 	"time"
 
-	managersdk "github.com/slidebolt/sb-manager-sdk"
+	testkit "github.com/slidebolt/sb-testkit"
 	scriptstore "github.com/slidebolt/sb-script/internal/store"
 )
 
 func TestOnStart_StartUsesStorageBackedDefinitions(t *testing.T) {
-	env := managersdk.NewTestEnv(t)
+	env := testkit.NewTestEnv(t)
 	env.Start("messenger")
 	env.Start("storage")
 

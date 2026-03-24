@@ -798,9 +798,11 @@ func TestScriptPrimitive_RunsOnceWhenStarted(t *testing.T) {
 	}
 
 	var called int32
-	msg.HandleFunc("plugin.dev1.light1.command.light_turn_on", func(m *messenger.Message) {
+	if _, err := msg.Subscribe("plugin.dev1.light1.command.light_turn_on", func(m *messenger.Message) {
 		atomic.AddInt32(&called, 1)
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	engine, err := New(msg, store)
 	if err != nil {
@@ -862,9 +864,11 @@ func TestScriptPrimitive_CtxAfterWorksWithoutInterval(t *testing.T) {
 	}
 
 	var callCount int32
-	msg.HandleFunc("plugin.dev1.light1.command.light_turn_on", func(m *messenger.Message) {
+	if _, err := msg.Subscribe("plugin.dev1.light1.command.light_turn_on", func(m *messenger.Message) {
 		atomic.AddInt32(&callCount, 1)
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	engine, err := New(msg, store)
 	if err != nil {
