@@ -611,45 +611,31 @@ func (rt *activationRuntime) activate(spec automationSpec, fn *lua.LFunction) {
 		if err == nil {
 			rt.vm.subs = append(rt.vm.subs, sub)
 		}
-	case "query":
-		w, err := storage.Watch(rt.msg, spec.trigger.query, storage.WatchHandlers{
-			OnAdd: func(_ string, data json.RawMessage) {
-				var ent domain.Entity
-				if err := json.Unmarshal(data, &ent); err != nil {
-					return
-				}
-				rt.invoke(fn, spec, &ent)
-			},
-			OnUpdate: func(_ string, data json.RawMessage) {
-				var ent domain.Entity
-				if err := json.Unmarshal(data, &ent); err != nil {
-					return
-				}
-				rt.invoke(fn, spec, &ent)
-			},
-		})
-		if err == nil {
-			rt.vm.subs = append(rt.vm.subs, watcherSubscription{watcher: w})
+	case "query", "query_ref":
+		invokeEntity := func(_ string, data json.RawMessage) {
+			var ent domain.Entity
+			if err := json.Unmarshal(data, &ent); err != nil {
+				return
+			}
+			rt.invoke(fn, spec, &ent)
 		}
-	case "query_ref":
 		w, err := storage.Watch(rt.msg, spec.trigger.query, storage.WatchHandlers{
-			OnAdd: func(_ string, data json.RawMessage) {
-				var ent domain.Entity
-				if err := json.Unmarshal(data, &ent); err != nil {
-					return
-				}
-				rt.invoke(fn, spec, &ent)
-			},
-			OnUpdate: func(_ string, data json.RawMessage) {
-				var ent domain.Entity
-				if err := json.Unmarshal(data, &ent); err != nil {
-					return
-				}
-				rt.invoke(fn, spec, &ent)
-			},
+			OnAdd:    invokeEntity,
+			OnUpdate: invokeEntity,
 		})
 		if err == nil {
 			rt.vm.subs = append(rt.vm.subs, watcherSubscription{watcher: w})
+			// Fire for entities already in storage that match the trigger query.
+			// Watch only sees state.changed events going forward; a pre-existing
+			// entity that doesn't change state would never trigger otherwise.
+			// Enqueue so invocations run after startInstance registers the instance
+			// record, which is required for markFired to persist the FireCount.
+			if entries, err := rt.store.Query(spec.trigger.query); err == nil {
+				for _, entry := range entries {
+					data := entry.Data
+					rt.vm.enqueue(func() { invokeEntity("", data) })
+				}
+			}
 		}
 	case "interval":
 		rt.scheduleEvery(spec.trigger, func() {

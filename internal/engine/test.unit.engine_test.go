@@ -989,3 +989,125 @@ func TestScriptDefinition_DoesNotAutoStart(t *testing.T) {
 		}
 	}
 }
+
+func TestQueryTrigger_FiresForPreExistingEntity(t *testing.T) {
+// Scenario: a switch is already ON when an automation that watches
+// powered-on switches is started. The automation should fire immediately
+// for the pre-existing entity without waiting for another state change.
+//
+// This fails with the current implementation because storage.Watch only
+// fires OnAdd/OnUpdate for events that arrive AFTER the subscription is
+// created. Entities already in storage are invisible to it.
+msg, err := messenger.Mock()
+if err != nil {
+t.Fatal(err)
+}
+defer msg.Close()
+
+store, err := storageserver.Mock(msg)
+if err != nil {
+t.Fatal(err)
+}
+defer store.Close()
+
+// Entity exists BEFORE the automation is started.
+if err := store.Save(domain.Entity{
+ID:       "switch1",
+Plugin:   "plugin",
+DeviceID: "dev1",
+Type:     "switch",
+Name:     "Switch",
+State:    domain.Switch{Power: true},
+}); err != nil {
+t.Fatal(err)
+}
+
+engine, err := New(msg, store)
+if err != nil {
+t.Fatal(err)
+}
+defer engine.Shutdown()
+
+source := `Automation("PreExistTrigger", {
+trigger = Query({
+where = {
+{ field = "type", op = "eq", value = "switch" },
+{ field = "state.power", op = "eq", value = true }
+}
+}),
+targets = None()
+}, function(ctx)
+end)`
+if err := saveDefinition(t, store, "PreExistTrigger", source); err != nil {
+t.Fatal(err)
+}
+
+hash, err := engine.StartScript("PreExistTrigger", "")
+if err != nil {
+t.Fatal(err)
+}
+
+// Expect the automation to fire for the pre-existing entity without
+// any state change being published on the bus.
+waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
+return inst.FireCount > 0
+})
+}
+
+func TestQueryRefTrigger_FiresForPreExistingEntity(t *testing.T) {
+// Same scenario as above but using QueryRef instead of inline Query.
+msg, err := messenger.Mock()
+if err != nil {
+t.Fatal(err)
+}
+defer msg.Close()
+
+store, err := storageserver.Mock(msg)
+if err != nil {
+t.Fatal(err)
+}
+defer store.Close()
+
+if err := store.Save(domain.Entity{
+ID:       "switch1",
+Plugin:   "plugin",
+DeviceID: "dev1",
+Type:     "switch",
+Name:     "Switch",
+State:    domain.Switch{Power: true},
+}); err != nil {
+t.Fatal(err)
+}
+if err := storage.SaveQueryDefinition(store, "live_switches", storage.Query{
+Where: []storage.Filter{
+{Field: "type", Op: storage.Eq, Value: "switch"},
+{Field: "state.power", Op: storage.Eq, Value: true},
+},
+}); err != nil {
+t.Fatal(err)
+}
+
+engine, err := New(msg, store)
+if err != nil {
+t.Fatal(err)
+}
+defer engine.Shutdown()
+
+source := `Automation("PreExistRefTrigger", {
+trigger = QueryRef("live_switches"),
+targets = None()
+}, function(ctx)
+end)`
+if err := saveDefinition(t, store, "PreExistRefTrigger", source); err != nil {
+t.Fatal(err)
+}
+
+hash, err := engine.StartScript("PreExistRefTrigger", "")
+if err != nil {
+t.Fatal(err)
+}
+
+waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
+return inst.FireCount > 0
+})
+}
