@@ -801,6 +801,14 @@ func (rt *activationRuntime) newContext(targets []domain.Entity, trigger *domain
 		}
 		return 0
 	}))
+	L.SetField(scriptsTbl, "stopAll", L.NewFunction(func(L *lua.LState) int {
+		queryRef := scriptControlQueryRef(L.Get(1))
+		if err := rt.engine.StopAllScripts(queryRef); err != nil {
+			L.RaiseError("stopAll %q: %v", queryRef, err)
+			return 0
+		}
+		return 0
+	}))
 	L.SetField(ctx, "scripts", scriptsTbl)
 	return ctx
 }

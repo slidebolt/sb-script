@@ -200,6 +200,15 @@ func APIReferenceDoc() APIReference {
 					{Name: "queryRef", Type: "string|table", Description: "Optional query ref string or table containing queryRef."},
 				},
 			},
+			{
+				Name:        "ctx.scripts:stopAll",
+				Kind:        "context_method",
+				Signature:   "ctx.scripts:stopAll(queryRef | {queryRef=...})",
+				Description: "Stops all running script instances whose targets overlap with the given query ref.",
+				Params: []ParamDoc{
+					{Name: "queryRef", Type: "string|table", Description: "Query ref string or table containing queryRef.", Required: true},
+				},
+			},
 		},
 	}
 }
