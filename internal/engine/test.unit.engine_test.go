@@ -1111,3 +1111,145 @@ waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
 return inst.FireCount > 0
 })
 }
+
+// ==========================================================================
+// ctx.send command validation
+//
+// ctx.send(entity, action, params) must validate the action name against the
+// domain registry before publishing. Unregistered actions must not reach the
+// bus — scripts calling typo'd or fabricated action names should surface an
+// error rather than silently pollute NATS.
+// ==========================================================================
+
+// TestCtxSend_UnknownActionNotPublished proves that calling ctx.send with an
+// action name not in the domain registry publishes nothing to NATS.
+// Today, the raw subject is built and published regardless of registration.
+func TestCtxSend_UnknownActionNotPublished(t *testing.T) {
+msg, err := messenger.Mock()
+if err != nil {
+t.Fatal(err)
+}
+defer msg.Close()
+
+store, err := storageserver.Mock(msg)
+if err != nil {
+t.Fatal(err)
+}
+defer store.Close()
+
+if err := store.Save(domain.Entity{
+ID: "light1", Plugin: "plugin", DeviceID: "dev1",
+Type: "light", Name: "Lamp", State: domain.Light{},
+}); err != nil {
+t.Fatal(err)
+}
+
+published := make(chan struct{}, 1)
+if _, err := msg.Subscribe("plugin.dev1.light1.command.not_a_real_action", func(m *messenger.Message) {
+published <- struct{}{}
+}); err != nil {
+t.Fatal(err)
+}
+if err := msg.Flush(); err != nil {
+t.Fatal(err)
+}
+
+engine, err := New(msg, store)
+if err != nil {
+t.Fatal(err)
+}
+defer engine.Shutdown()
+
+source := `Script("BadSend", function(ctx)
+local e = ctx.queryOne("plugin.dev1.light1")
+ctx.send(e, "not_a_real_action", {})
+end)`
+if err := saveDefinition(t, store, "BadSend", source); err != nil {
+t.Fatal(err)
+}
+
+hash, err := engine.StartScript("BadSend", "")
+if err != nil {
+t.Fatal(err)
+}
+
+waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
+return inst.FireCount > 0
+})
+
+select {
+case <-published:
+t.Fatal("unknown action was published to NATS — should have been rejected")
+case <-time.After(300 * time.Millisecond):
+// correct: nothing published
+}
+}
+
+// TestCtxSend_KnownActionDelivered proves that ctx.send with a registered
+// action still delivers to the bus after the validation is added.
+func TestCtxSend_KnownActionDelivered(t *testing.T) {
+msg, err := messenger.Mock()
+if err != nil {
+t.Fatal(err)
+}
+defer msg.Close()
+
+store, err := storageserver.Mock(msg)
+if err != nil {
+t.Fatal(err)
+}
+defer store.Close()
+
+if err := store.Save(domain.Entity{
+ID: "light1", Plugin: "plugin", DeviceID: "dev1",
+Type: "light", Name: "Lamp", State: domain.Light{},
+}); err != nil {
+t.Fatal(err)
+}
+
+published := make(chan []byte, 1)
+if _, err := msg.Subscribe("plugin.dev1.light1.command.light_set_brightness", func(m *messenger.Message) {
+published <- m.Data
+}); err != nil {
+t.Fatal(err)
+}
+if err := msg.Flush(); err != nil {
+t.Fatal(err)
+}
+
+engine, err := New(msg, store)
+if err != nil {
+t.Fatal(err)
+}
+defer engine.Shutdown()
+
+source := `Script("GoodSend", function(ctx)
+local e = ctx.queryOne("plugin.dev1.light1")
+ctx.send(e, "light_set_brightness", {brightness=150})
+end)`
+if err := saveDefinition(t, store, "GoodSend", source); err != nil {
+t.Fatal(err)
+}
+
+hash, err := engine.StartScript("GoodSend", "")
+if err != nil {
+t.Fatal(err)
+}
+
+waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
+return inst.FireCount > 0
+})
+
+select {
+case data := <-published:
+var cmd domain.LightSetBrightness
+if err := json.Unmarshal(data, &cmd); err != nil {
+t.Fatalf("unmarshal: %v", err)
+}
+if cmd.Brightness != 150 {
+t.Fatalf("brightness: got %d want 150", cmd.Brightness)
+}
+case <-time.After(2 * time.Second):
+t.Fatal("timed out waiting for command")
+}
+}

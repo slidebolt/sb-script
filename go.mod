@@ -10,7 +10,6 @@ require (
 	github.com/slidebolt/sb-runtime v1.0.2
 	github.com/slidebolt/sb-storage-sdk v1.0.2
 	github.com/slidebolt/sb-storage-server v1.0.2
-	github.com/slidebolt/sb-testkit v1.0.2
 	github.com/yuin/gopher-lua v1.1.1
 )
 

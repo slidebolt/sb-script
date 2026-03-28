@@ -287,6 +287,12 @@ func (e *Engine) startInstance(name, queryRef string) error {
 	e.instances[hash] = &persistedInstance{vm: vm, record: record}
 	e.mu.Unlock()
 
+	// Enqueue initial invocations AFTER the instance is registered so that
+	// markFired can find the record when these run on the VM goroutine.
+	for _, fn := range rt.initialInvocations {
+		vm.enqueue(fn)
+	}
+
 	return e.store.Save(record)
 }
 
@@ -433,18 +439,19 @@ type targetSpec struct {
 }
 
 type activationRuntime struct {
-	engine        *Engine
-	msg           messenger.Messenger
-	store         storage.Storage
-	vm            *luaVM
-	name          string
-	queryRef      string
-	queryOverride *storage.Query
-	activated     bool
-	random        *rand.Rand
-	spec          automationSpec
-	scriptFn      *lua.LFunction
-	nextFireAt    *time.Time
+	engine           *Engine
+	msg              messenger.Messenger
+	store            storage.Storage
+	vm               *luaVM
+	name             string
+	queryRef         string
+	queryOverride    *storage.Query
+	activated        bool
+	random           *rand.Rand
+	spec             automationSpec
+	scriptFn         *lua.LFunction
+	nextFireAt       *time.Time
+	initialInvocations []func() // enqueued after instance registration
 }
 
 func (rt *activationRuntime) injectAutomationAPI() {
@@ -630,10 +637,13 @@ func (rt *activationRuntime) activate(spec automationSpec, fn *lua.LFunction) {
 			// entity that doesn't change state would never trigger otherwise.
 			// Enqueue so invocations run after startInstance registers the instance
 			// record, which is required for markFired to persist the FireCount.
-			if entries, err := rt.store.Query(spec.trigger.query); err == nil {
+			if entries, qerr := rt.store.Query(spec.trigger.query); qerr == nil {
 				for _, entry := range entries {
 					data := entry.Data
-					rt.vm.enqueue(func() { invokeEntity("", data) })
+					// Defer to after instance registration so markFired can find the record.
+					rt.initialInvocations = append(rt.initialInvocations, func() {
+						invokeEntity("", data)
+					})
 				}
 			}
 		}
@@ -731,6 +741,10 @@ func (rt *activationRuntime) newContext(targets []domain.Entity, trigger *domain
 			if paramsTbl, ok := L.Get(3).(*lua.LTable); ok {
 				paramsJSON, _ = json.Marshal(luaTableToMap(paramsTbl))
 			}
+		}
+		if _, ok := domain.LookupCommand(action); !ok {
+			slog.Warn("sb-script: ctx.send unknown action, not published", "name", rt.name, "action", action)
+			return 0
 		}
 		key := lua.LVAsString(L.GetField(entityTbl, "key"))
 		_ = rt.msg.Publish(key+".command."+action, paramsJSON)
