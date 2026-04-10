@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	logging "github.com/slidebolt/sb-logging-sdk"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
 	"github.com/slidebolt/sb-script/internal/engine"
 	storage "github.com/slidebolt/sb-storage-sdk"
@@ -22,7 +23,11 @@ type Service struct {
 // New creates a scripting service connected to the given messenger and storage.
 // The engine is started immediately and NATS API subscriptions are registered.
 func New(msg messenger.Messenger, store storage.Storage) (*Service, error) {
-	eng, err := engine.New(msg, store)
+	return NewWithLogger(msg, store, nil)
+}
+
+func NewWithLogger(msg messenger.Messenger, store storage.Storage, logger logging.Store) (*Service, error) {
+	eng, err := engine.NewWithLogger(msg, store, logger)
 	if err != nil {
 		return nil, fmt.Errorf("sb-script/server: start engine: %w", err)
 	}
@@ -89,15 +94,15 @@ func (s *Service) subscribeAPI(msg messenger.Messenger) error {
 	sub1, err := msg.Subscribe("script.start", func(m *messenger.Message) {
 		var req startRequest
 		if err := json.Unmarshal(m.Data, &req); err != nil {
-			m.Respond(apiErr(err))
+			m.RespondWithHeaders(apiErr(err), messenger.CopyHeaders(m.Headers))
 			return
 		}
-		hash, err := s.engine.StartScript(req.Name, req.QueryRef)
+		hash, err := s.engine.StartScriptWithTrace(req.Name, req.QueryRef, messenger.TraceID(m.Headers))
 		if err != nil {
-			m.Respond(apiErr(err))
+			m.RespondWithHeaders(apiErr(err), messenger.CopyHeaders(m.Headers))
 			return
 		}
-		m.Respond(okHash(hash))
+		m.RespondWithHeaders(okHash(hash), messenger.CopyHeaders(m.Headers))
 	})
 	if err != nil {
 		return fmt.Errorf("subscribe script.start: %w", err)
@@ -107,14 +112,14 @@ func (s *Service) subscribeAPI(msg messenger.Messenger) error {
 	sub2, err := msg.Subscribe("script.stop", func(m *messenger.Message) {
 		var req stopRequest
 		if err := json.Unmarshal(m.Data, &req); err != nil {
-			m.Respond(apiErr(err))
+			m.RespondWithHeaders(apiErr(err), messenger.CopyHeaders(m.Headers))
 			return
 		}
-		if err := s.engine.StopScript(req.Name, req.QueryRef); err != nil {
-			m.Respond(apiErr(err))
+		if err := s.engine.StopScriptWithTrace(req.Name, req.QueryRef, messenger.TraceID(m.Headers)); err != nil {
+			m.RespondWithHeaders(apiErr(err), messenger.CopyHeaders(m.Headers))
 			return
 		}
-		m.Respond(ok())
+		m.RespondWithHeaders(ok(), messenger.CopyHeaders(m.Headers))
 	})
 	if err != nil {
 		return fmt.Errorf("subscribe script.stop: %w", err)
@@ -124,14 +129,14 @@ func (s *Service) subscribeAPI(msg messenger.Messenger) error {
 	sub3, err := msg.Subscribe("script.stop_all", func(m *messenger.Message) {
 		var req stopAllRequest
 		if err := json.Unmarshal(m.Data, &req); err != nil {
-			m.Respond(apiErr(err))
+			m.RespondWithHeaders(apiErr(err), messenger.CopyHeaders(m.Headers))
 			return
 		}
-		if err := s.engine.StopAllScripts(req.QueryRef); err != nil {
-			m.Respond(apiErr(err))
+		if err := s.engine.StopAllScriptsWithTrace(req.QueryRef, messenger.TraceID(m.Headers)); err != nil {
+			m.RespondWithHeaders(apiErr(err), messenger.CopyHeaders(m.Headers))
 			return
 		}
-		m.Respond(ok())
+		m.RespondWithHeaders(ok(), messenger.CopyHeaders(m.Headers))
 	})
 	if err != nil {
 		return fmt.Errorf("subscribe script.stop_all: %w", err)

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -10,6 +11,9 @@ import (
 	"time"
 
 	domain "github.com/slidebolt/sb-domain"
+	logcfg "github.com/slidebolt/sb-logging"
+	logging "github.com/slidebolt/sb-logging-sdk"
+	logserver "github.com/slidebolt/sb-logging/server"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
 	scriptstore "github.com/slidebolt/sb-script/internal/store"
 	storage "github.com/slidebolt/sb-storage-sdk"
@@ -773,6 +777,72 @@ func saveAutomation(t *testing.T, store storage.Storage, name, source string) er
 	})
 }
 
+func waitForDecisionLabel(t *testing.T, logger logging.Store, entityKey, label string) logging.Event {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		events, err := logger.List(context.Background(), logging.ListRequest{
+			Source: "sb-script",
+			Kind:   "automation.decision",
+			Limit:  100,
+		})
+		if err == nil {
+			for _, event := range events {
+				if event.Data["label"] == label {
+					return event
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for automation.decision label %q", label)
+	return logging.Event{}
+}
+
+func assertDecisionLabelAbsent(t *testing.T, logger logging.Store, label string, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		events, err := logger.List(context.Background(), logging.ListRequest{
+			Source: "sb-script",
+			Kind:   "automation.decision",
+			Limit:  100,
+		})
+		if err == nil {
+			for _, event := range events {
+				if event.Data["label"] == label {
+					t.Fatalf("unexpected automation.decision label %q recorded", label)
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func assertDecisionLabelAbsentAfter(t *testing.T, logger logging.Store, label string, beforeCount int, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		events, err := logger.List(context.Background(), logging.ListRequest{
+			Source: "sb-script",
+			Kind:   "automation.decision",
+			Limit:  200,
+		})
+		if err == nil {
+			if len(events) < beforeCount {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			for _, event := range events[beforeCount:] {
+				if event.Data["label"] == label {
+					t.Fatalf("unexpected new automation.decision label %q recorded", label)
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestScriptPrimitive_RunsOnceWhenStarted(t *testing.T) {
 	msg, err := messenger.Mock()
 	if err != nil {
@@ -990,45 +1060,412 @@ func TestScriptDefinition_DoesNotAutoStart(t *testing.T) {
 	}
 }
 
+func TestAutomationDefinition_SavedAfterEngineStartDoesNotHotReload(t *testing.T) {
+	t.Skip("reference for pre-hot-reload behavior")
+
+	msg, err := messenger.Mock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Close()
+
+	store, err := storageserver.Mock(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	svc, err := logserver.New(logcfg.Config{Target: "memory"})
+	if err != nil {
+		t.Fatalf("server.New(memory): %v", err)
+	}
+	logger := svc.Store()
+
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "binary_sensor",
+		Name:     "Switch",
+		State:    domain.BinarySensor{On: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	engine, err := NewWithLogger(msg, store, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Shutdown()
+
+	source := `Automation("LateBoundAutomation", {
+		trigger = Entity("plugin.dev1.switch1"),
+		targets = None()
+	}, function(ctx)
+		ctx.decision("late_bound_fired", { trigger_on = ctx.trigger.entity.state.on })
+	end)`
+	if err := saveAutomation(t, store, "LateBoundAutomation", source); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "binary_sensor",
+		Name:     "Switch",
+		State:    domain.BinarySensor{On: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	hash := scriptstore.HashInstance("LateBoundAutomation", "")
+	entries, err := store.Search("sb-script.instances.*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		var inst scriptstore.Instance
+		if json.Unmarshal(entry.Data, &inst) == nil && inst.Hash == hash {
+			t.Fatal("automation saved after engine start should not hot-reload, but found a running instance")
+		}
+	}
+
+	events, err := logger.List(context.Background(), logging.ListRequest{
+		Source: "sb-script",
+		Kind:   "automation.triggered",
+		Limit:  20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Data["name"] == "LateBoundAutomation" {
+			t.Fatal("automation saved after engine start should not hot-reload, but trigger log was recorded")
+		}
+	}
+}
+
+func TestAutomationDefinition_SavedAfterEngineStart_HotReloadsExpected(t *testing.T) {
+	msg, err := messenger.Mock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Close()
+
+	store, err := storageserver.Mock(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	logSvc, err := logserver.New(logcfg.Config{Target: "memory"})
+	if err != nil {
+		t.Fatalf("log server: %v", err)
+	}
+	logger := logSvc.Store()
+
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "binary_sensor",
+		Name:     "Switch",
+		State:    domain.BinarySensor{On: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	engine, err := NewWithLogger(msg, store, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Shutdown()
+
+	source := `Automation("LateBoundAutomationHot", {
+		trigger = Entity("plugin.dev1.switch1"),
+		targets = None()
+	}, function(ctx)
+		ctx.decision("late_bound_hot_add", { trigger_on = ctx.trigger.entity.state.on })
+	end)`
+	if err := saveAutomation(t, store, "LateBoundAutomationHot", source); err != nil {
+		t.Fatal(err)
+	}
+
+	hash := scriptstore.HashInstance("LateBoundAutomationHot", "")
+	waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
+		return inst.Name == "LateBoundAutomationHot" && inst.Status == "running"
+	})
+
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "binary_sensor",
+		Name:     "Switch",
+		State:    domain.BinarySensor{On: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
+		return inst.Name == "LateBoundAutomationHot" && inst.Status == "running" && inst.FireCount > 0
+	})
+
+	waitForDecisionLabel(t, logger, "plugin.dev1.switch1", "late_bound_hot_add")
+}
+
+func TestAutomationDefinition_UpdatedAfterEngineStart_HotReloadsExpected(t *testing.T) {
+	msg, err := messenger.Mock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Close()
+
+	store, err := storageserver.Mock(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	logSvc, err := logserver.New(logcfg.Config{Target: "memory"})
+	if err != nil {
+		t.Fatalf("log server: %v", err)
+	}
+	logger := logSvc.Store()
+
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "binary_sensor",
+		Name:     "Switch",
+		State:    domain.BinarySensor{On: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	v1 := `Automation("HotUpdateAutomation", {
+		trigger = Entity("plugin.dev1.switch1"),
+		targets = None()
+	}, function(ctx)
+		if ctx.trigger.entity.state.on then
+			ctx.decision("hot_update_v1", { trigger_on = true })
+		end
+	end)`
+	if err := saveAutomation(t, store, "HotUpdateAutomation", v1); err != nil {
+		t.Fatal(err)
+	}
+
+	engine, err := NewWithLogger(msg, store, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Shutdown()
+
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "binary_sensor",
+		Name:     "Switch",
+		State:    domain.BinarySensor{On: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForDecisionLabel(t, logger, "plugin.dev1.switch1", "hot_update_v1")
+
+	v2 := `Automation("HotUpdateAutomation", {
+		trigger = Entity("plugin.dev1.switch1"),
+		targets = None()
+	}, function(ctx)
+		if ctx.trigger.entity.state.on then
+			ctx.decision("hot_update_v2", { trigger_on = true })
+		end
+	end)`
+	if err := saveAutomation(t, store, "HotUpdateAutomation", v2); err != nil {
+		t.Fatal(err)
+	}
+	waitForInstance(t, store, scriptstore.HashInstance("HotUpdateAutomation", ""), func(inst scriptstore.Instance) bool {
+		return inst.Name == "HotUpdateAutomation" && inst.Status == "running"
+	})
+
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "binary_sensor",
+		Name:     "Switch",
+		State:    domain.BinarySensor{On: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "binary_sensor",
+		Name:     "Switch",
+		State:    domain.BinarySensor{On: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForDecisionLabel(t, logger, "plugin.dev1.switch1", "hot_update_v2")
+}
+
+func TestAutomationDefinition_DeletedAfterEngineStart_HotReloadsExpected(t *testing.T) {
+	msg, err := messenger.Mock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Close()
+
+	store, err := storageserver.Mock(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	logSvc, err := logserver.New(logcfg.Config{Target: "memory"})
+	if err != nil {
+		t.Fatalf("log server: %v", err)
+	}
+	logger := logSvc.Store()
+
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "binary_sensor",
+		Name:     "Switch",
+		State:    domain.BinarySensor{On: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	source := `Automation("HotDeleteAutomation", {
+		trigger = Entity("plugin.dev1.switch1"),
+		targets = None()
+	}, function(ctx)
+		if ctx.trigger.entity.state.on then
+			ctx.decision("hot_delete_live", { trigger_on = true })
+		end
+	end)`
+	if err := saveAutomation(t, store, "HotDeleteAutomation", source); err != nil {
+		t.Fatal(err)
+	}
+
+	engine, err := NewWithLogger(msg, store, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Shutdown()
+
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "binary_sensor",
+		Name:     "Switch",
+		State:    domain.BinarySensor{On: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "binary_sensor",
+		Name:     "Switch",
+		State:    domain.BinarySensor{On: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForDecisionLabel(t, logger, "plugin.dev1.switch1", "hot_delete_live")
+
+	beforeEvents, err := logger.List(context.Background(), logging.ListRequest{
+		Source: "sb-script",
+		Kind:   "automation.decision",
+		Limit:  100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeCount := len(beforeEvents)
+
+	if err := store.Delete(scriptstore.DefinitionKey{Name: "HotDeleteAutomation"}); err != nil {
+		t.Fatal(err)
+	}
+
+	hash := scriptstore.HashInstance("HotDeleteAutomation", "")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err := store.Get(scriptstore.InstanceKey{Hash: hash})
+		if err != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "binary_sensor",
+		Name:     "Switch",
+		State:    domain.BinarySensor{On: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	assertDecisionLabelAbsentAfter(t, logger, "hot_delete_live", beforeCount, 300*time.Millisecond)
+}
+
 func TestQueryTrigger_FiresForPreExistingEntity(t *testing.T) {
-// Scenario: a switch is already ON when an automation that watches
-// powered-on switches is started. The automation should fire immediately
-// for the pre-existing entity without waiting for another state change.
-//
-// This fails with the current implementation because storage.Watch only
-// fires OnAdd/OnUpdate for events that arrive AFTER the subscription is
-// created. Entities already in storage are invisible to it.
-msg, err := messenger.Mock()
-if err != nil {
-t.Fatal(err)
-}
-defer msg.Close()
+	// Scenario: a switch is already ON when an automation that watches
+	// powered-on switches is started. The automation should fire immediately
+	// for the pre-existing entity without waiting for another state change.
+	//
+	// This fails with the current implementation because storage.Watch only
+	// fires OnAdd/OnUpdate for events that arrive AFTER the subscription is
+	// created. Entities already in storage are invisible to it.
+	msg, err := messenger.Mock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Close()
 
-store, err := storageserver.Mock(msg)
-if err != nil {
-t.Fatal(err)
-}
-defer store.Close()
+	store, err := storageserver.Mock(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
 
-// Entity exists BEFORE the automation is started.
-if err := store.Save(domain.Entity{
-ID:       "switch1",
-Plugin:   "plugin",
-DeviceID: "dev1",
-Type:     "switch",
-Name:     "Switch",
-State:    domain.Switch{Power: true},
-}); err != nil {
-t.Fatal(err)
-}
+	// Entity exists BEFORE the automation is started.
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "switch",
+		Name:     "Switch",
+		State:    domain.Switch{Power: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-engine, err := New(msg, store)
-if err != nil {
-t.Fatal(err)
-}
-defer engine.Shutdown()
+	engine, err := New(msg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Shutdown()
 
-source := `Automation("PreExistTrigger", {
+	source := `Automation("PreExistTrigger", {
 trigger = Query({
 where = {
 { field = "type", op = "eq", value = "switch" },
@@ -1038,78 +1475,78 @@ where = {
 targets = None()
 }, function(ctx)
 end)`
-if err := saveDefinition(t, store, "PreExistTrigger", source); err != nil {
-t.Fatal(err)
-}
+	if err := saveDefinition(t, store, "PreExistTrigger", source); err != nil {
+		t.Fatal(err)
+	}
 
-hash, err := engine.StartScript("PreExistTrigger", "")
-if err != nil {
-t.Fatal(err)
-}
+	hash, err := engine.StartScript("PreExistTrigger", "")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-// Expect the automation to fire for the pre-existing entity without
-// any state change being published on the bus.
-waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
-return inst.FireCount > 0
-})
+	// Expect the automation to fire for the pre-existing entity without
+	// any state change being published on the bus.
+	waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
+		return inst.FireCount > 0
+	})
 }
 
 func TestQueryRefTrigger_FiresForPreExistingEntity(t *testing.T) {
-// Same scenario as above but using QueryRef instead of inline Query.
-msg, err := messenger.Mock()
-if err != nil {
-t.Fatal(err)
-}
-defer msg.Close()
+	// Same scenario as above but using QueryRef instead of inline Query.
+	msg, err := messenger.Mock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Close()
 
-store, err := storageserver.Mock(msg)
-if err != nil {
-t.Fatal(err)
-}
-defer store.Close()
+	store, err := storageserver.Mock(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
 
-if err := store.Save(domain.Entity{
-ID:       "switch1",
-Plugin:   "plugin",
-DeviceID: "dev1",
-Type:     "switch",
-Name:     "Switch",
-State:    domain.Switch{Power: true},
-}); err != nil {
-t.Fatal(err)
-}
-if err := storage.SaveQueryDefinition(store, "live_switches", storage.Query{
-Where: []storage.Filter{
-{Field: "type", Op: storage.Eq, Value: "switch"},
-{Field: "state.power", Op: storage.Eq, Value: true},
-},
-}); err != nil {
-t.Fatal(err)
-}
+	if err := store.Save(domain.Entity{
+		ID:       "switch1",
+		Plugin:   "plugin",
+		DeviceID: "dev1",
+		Type:     "switch",
+		Name:     "Switch",
+		State:    domain.Switch{Power: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SaveQueryDefinition(store, "live_switches", storage.Query{
+		Where: []storage.Filter{
+			{Field: "type", Op: storage.Eq, Value: "switch"},
+			{Field: "state.power", Op: storage.Eq, Value: true},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-engine, err := New(msg, store)
-if err != nil {
-t.Fatal(err)
-}
-defer engine.Shutdown()
+	engine, err := New(msg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Shutdown()
 
-source := `Automation("PreExistRefTrigger", {
+	source := `Automation("PreExistRefTrigger", {
 trigger = QueryRef("live_switches"),
 targets = None()
 }, function(ctx)
 end)`
-if err := saveDefinition(t, store, "PreExistRefTrigger", source); err != nil {
-t.Fatal(err)
-}
+	if err := saveDefinition(t, store, "PreExistRefTrigger", source); err != nil {
+		t.Fatal(err)
+	}
 
-hash, err := engine.StartScript("PreExistRefTrigger", "")
-if err != nil {
-t.Fatal(err)
-}
+	hash, err := engine.StartScript("PreExistRefTrigger", "")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
-return inst.FireCount > 0
-})
+	waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
+		return inst.FireCount > 0
+	})
 }
 
 // ==========================================================================
@@ -1125,131 +1562,207 @@ return inst.FireCount > 0
 // action name not in the domain registry publishes nothing to NATS.
 // Today, the raw subject is built and published regardless of registration.
 func TestCtxSend_UnknownActionNotPublished(t *testing.T) {
-msg, err := messenger.Mock()
-if err != nil {
-t.Fatal(err)
-}
-defer msg.Close()
+	msg, err := messenger.Mock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Close()
 
-store, err := storageserver.Mock(msg)
-if err != nil {
-t.Fatal(err)
-}
-defer store.Close()
+	store, err := storageserver.Mock(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
 
-if err := store.Save(domain.Entity{
-ID: "light1", Plugin: "plugin", DeviceID: "dev1",
-Type: "light", Name: "Lamp", State: domain.Light{},
-}); err != nil {
-t.Fatal(err)
-}
+	if err := store.Save(domain.Entity{
+		ID: "light1", Plugin: "plugin", DeviceID: "dev1",
+		Type: "light", Name: "Lamp", State: domain.Light{},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-published := make(chan struct{}, 1)
-if _, err := msg.Subscribe("plugin.dev1.light1.command.not_a_real_action", func(m *messenger.Message) {
-published <- struct{}{}
-}); err != nil {
-t.Fatal(err)
-}
-if err := msg.Flush(); err != nil {
-t.Fatal(err)
-}
+	published := make(chan struct{}, 1)
+	if _, err := msg.Subscribe("plugin.dev1.light1.command.not_a_real_action", func(m *messenger.Message) {
+		published <- struct{}{}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := msg.Flush(); err != nil {
+		t.Fatal(err)
+	}
 
-engine, err := New(msg, store)
-if err != nil {
-t.Fatal(err)
-}
-defer engine.Shutdown()
+	engine, err := New(msg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Shutdown()
 
-source := `Script("BadSend", function(ctx)
+	source := `Script("BadSend", function(ctx)
 local e = ctx.queryOne("plugin.dev1.light1")
 ctx.send(e, "not_a_real_action", {})
 end)`
-if err := saveDefinition(t, store, "BadSend", source); err != nil {
-t.Fatal(err)
-}
+	if err := saveDefinition(t, store, "BadSend", source); err != nil {
+		t.Fatal(err)
+	}
 
-hash, err := engine.StartScript("BadSend", "")
-if err != nil {
-t.Fatal(err)
-}
+	hash, err := engine.StartScript("BadSend", "")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
-return inst.FireCount > 0
-})
+	waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
+		return inst.FireCount > 0
+	})
 
-select {
-case <-published:
-t.Fatal("unknown action was published to NATS — should have been rejected")
-case <-time.After(300 * time.Millisecond):
-// correct: nothing published
-}
+	select {
+	case <-published:
+		t.Fatal("unknown action was published to NATS — should have been rejected")
+	case <-time.After(300 * time.Millisecond):
+		// correct: nothing published
+	}
 }
 
 // TestCtxSend_KnownActionDelivered proves that ctx.send with a registered
 // action still delivers to the bus after the validation is added.
 func TestCtxSend_KnownActionDelivered(t *testing.T) {
-msg, err := messenger.Mock()
-if err != nil {
-t.Fatal(err)
-}
-defer msg.Close()
+	msg, err := messenger.Mock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Close()
 
-store, err := storageserver.Mock(msg)
-if err != nil {
-t.Fatal(err)
-}
-defer store.Close()
+	store, err := storageserver.Mock(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
 
-if err := store.Save(domain.Entity{
-ID: "light1", Plugin: "plugin", DeviceID: "dev1",
-Type: "light", Name: "Lamp", State: domain.Light{},
-}); err != nil {
-t.Fatal(err)
-}
+	if err := store.Save(domain.Entity{
+		ID: "light1", Plugin: "plugin", DeviceID: "dev1",
+		Type: "light", Name: "Lamp", State: domain.Light{},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-published := make(chan []byte, 1)
-if _, err := msg.Subscribe("plugin.dev1.light1.command.light_set_brightness", func(m *messenger.Message) {
-published <- m.Data
-}); err != nil {
-t.Fatal(err)
-}
-if err := msg.Flush(); err != nil {
-t.Fatal(err)
-}
+	published := make(chan []byte, 1)
+	if _, err := msg.Subscribe("plugin.dev1.light1.command.light_set_brightness", func(m *messenger.Message) {
+		published <- m.Data
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := msg.Flush(); err != nil {
+		t.Fatal(err)
+	}
 
-engine, err := New(msg, store)
-if err != nil {
-t.Fatal(err)
-}
-defer engine.Shutdown()
+	engine, err := New(msg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Shutdown()
 
-source := `Script("GoodSend", function(ctx)
+	source := `Script("GoodSend", function(ctx)
 local e = ctx.queryOne("plugin.dev1.light1")
 ctx.send(e, "light_set_brightness", {brightness=150})
 end)`
-if err := saveDefinition(t, store, "GoodSend", source); err != nil {
-t.Fatal(err)
+	if err := saveDefinition(t, store, "GoodSend", source); err != nil {
+		t.Fatal(err)
+	}
+
+	hash, err := engine.StartScript("GoodSend", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
+		return inst.FireCount > 0
+	})
+
+	select {
+	case data := <-published:
+		var cmd domain.LightSetBrightness
+		if err := json.Unmarshal(data, &cmd); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if cmd.Brightness != 150 {
+			t.Fatalf("brightness: got %d want 150", cmd.Brightness)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for command")
+	}
 }
 
-hash, err := engine.StartScript("GoodSend", "")
-if err != nil {
-t.Fatal(err)
-}
+func TestCtxDecision_AppendsStructuredDecisionLog(t *testing.T) {
+	msg, err := messenger.Mock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Close()
 
-waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
-return inst.FireCount > 0
-})
+	store, err := storageserver.Mock(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
 
-select {
-case data := <-published:
-var cmd domain.LightSetBrightness
-if err := json.Unmarshal(data, &cmd); err != nil {
-t.Fatalf("unmarshal: %v", err)
-}
-if cmd.Brightness != 150 {
-t.Fatalf("brightness: got %d want 150", cmd.Brightness)
-}
-case <-time.After(2 * time.Second):
-t.Fatal("timed out waiting for command")
-}
+	logSvc, err := logserver.New(logcfg.Config{Target: "memory"})
+	if err != nil {
+		t.Fatalf("log server: %v", err)
+	}
+	logger := logSvc.Store()
+
+	engine, err := NewWithLogger(msg, store, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Shutdown()
+
+	source := `Script("DecisionLog", function(ctx)
+ctx.decision("ignored_falling_edge", {trigger_on=false, reason="button pulse complete"})
+end)`
+	if err := saveDefinition(t, store, "DecisionLog", source); err != nil {
+		t.Fatal(err)
+	}
+
+	hash, err := engine.StartScript("DecisionLog", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
+		return inst.FireCount > 0
+	})
+
+	var events []logging.Event
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		events, err = logger.List(context.Background(), logging.ListRequest{
+			Source: "sb-script",
+			Kind:   "automation.decision",
+			Limit:  10,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(events) != 1 {
+		allEvents, _ := logger.List(context.Background(), logging.ListRequest{Source: "sb-script", Limit: 20})
+		for _, event := range allEvents {
+			raw, _ := json.Marshal(event)
+			t.Logf("event: %s", raw)
+		}
+		t.Fatalf("decision log count: got %d want 1", len(events))
+	}
+	if got := events[0].Data["label"]; got != "ignored_falling_edge" {
+		t.Fatalf("decision label: got %v want %q", got, "ignored_falling_edge")
+	}
+	if got := events[0].Data["reason"]; got != "button pulse complete" {
+		t.Fatalf("decision reason: got %v want %q", got, "button pulse complete")
+	}
+	if got := events[0].Data["trigger_on"]; got != false {
+		t.Fatalf("decision trigger_on: got %v want false", got)
+	}
 }

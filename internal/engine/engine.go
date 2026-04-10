@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
 	domain "github.com/slidebolt/sb-domain"
+	logging "github.com/slidebolt/sb-logging-sdk"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
 	scriptstore "github.com/slidebolt/sb-script/internal/store"
 	storage "github.com/slidebolt/sb-storage-sdk"
@@ -17,12 +19,16 @@ import (
 
 // Engine manages passive automation definitions and active automation VMs.
 type Engine struct {
-	msg   messenger.Messenger
-	store storage.Storage
+	msg    messenger.Messenger
+	store  storage.Storage
+	logger logging.Store
 
-	mu          sync.RWMutex
-	definitions map[string]string             // name -> lua source
-	instances   map[string]*persistedInstance // hash(name+query) -> active automation VM
+	mu           sync.RWMutex
+	definitions  map[string]string             // name -> lua source
+	defTypes     map[string]string             // name -> definition type
+	instances    map[string]*persistedInstance // hash(name+query) -> active automation VM
+	defWatcher   *storage.Watcher
+	defDeleteSub messenger.Subscription
 }
 
 type persistedInstance struct {
@@ -42,10 +48,16 @@ func (w watcherSubscription) Unsubscribe() error {
 }
 
 func New(msg messenger.Messenger, store storage.Storage) (*Engine, error) {
+	return NewWithLogger(msg, store, nil)
+}
+
+func NewWithLogger(msg messenger.Messenger, store storage.Storage, logger logging.Store) (*Engine, error) {
 	e := &Engine{
 		msg:         msg,
 		store:       store,
+		logger:      logger,
 		definitions: make(map[string]string),
+		defTypes:    make(map[string]string),
 		instances:   make(map[string]*persistedInstance),
 	}
 
@@ -68,6 +80,7 @@ func New(msg messenger.Messenger, store storage.Storage) (*Engine, error) {
 			continue
 		}
 		e.definitions[def.Name] = def.Source
+		e.defTypes[def.Name] = def.Type
 		if def.Type == "automation" {
 			automationNames = append(automationNames, def.Name)
 		}
@@ -101,40 +114,52 @@ func New(msg messenger.Messenger, store storage.Storage) (*Engine, error) {
 		}
 	}
 
+	if err := e.startDefinitionWatcher(entries); err != nil {
+		return nil, err
+	}
+	if err := e.startDefinitionDeleteWatcher(); err != nil {
+		e.Shutdown()
+		return nil, err
+	}
+
 	return e, nil
 }
 
 func (e *Engine) DeleteDefinition(name string) error {
-	var toClose []*luaVM
-	e.mu.Lock()
-	for hash, instVM := range e.instances {
-		if instVM.record.Name == name {
-			toClose = append(toClose, instVM.vm)
-			delete(e.instances, hash)
-			e.store.Delete(scriptstore.InstanceKey{Hash: hash})
-		}
-	}
-	delete(e.definitions, name)
-	e.mu.Unlock()
-	for _, vm := range toClose {
-		go vm.close()
-	}
-
+	e.removeDefinitionByName(name)
 	return e.store.Delete(scriptstore.DefinitionKey{Name: name})
 }
 
 func (e *Engine) StartScript(name, queryRef string) (string, error) {
+	return e.StartScriptWithTrace(name, queryRef, "")
+}
+
+func (e *Engine) StartScriptWithTrace(name, queryRef, traceID string) (string, error) {
 	hash := scriptstore.HashInstance(name, queryRef)
 	e.mu.RLock()
 	_, exists := e.instances[hash]
 	e.mu.RUnlock()
 	if exists {
+		e.appendLog("script.start.skipped", "info", "script start skipped; instance already running", traceID, map[string]any{
+			"name":          name,
+			"query_ref":     queryRef,
+			"instance_hash": hash,
+		})
 		return hash, nil
 	}
+	e.appendLog("script.start.requested", "info", "script start requested", traceID, map[string]any{
+		"name":          name,
+		"query_ref":     queryRef,
+		"instance_hash": hash,
+	})
 	return hash, e.startInstance(name, queryRef)
 }
 
 func (e *Engine) StopScript(name, queryRef string) error {
+	return e.StopScriptWithTrace(name, queryRef, "")
+}
+
+func (e *Engine) StopScriptWithTrace(name, queryRef, traceID string) error {
 	hash := scriptstore.HashInstance(name, queryRef)
 	var vm *luaVM
 	e.mu.Lock()
@@ -147,15 +172,30 @@ func (e *Engine) StopScript(name, queryRef string) error {
 		e.store.Delete(scriptstore.InstanceKey{Hash: hash})
 		go vm.close()
 	}
+	e.appendLog("script.stop.requested", "info", "script stop requested", traceID, map[string]any{
+		"name":          name,
+		"query_ref":     queryRef,
+		"instance_hash": hash,
+	})
 	return nil
 }
 
 func (e *Engine) StopAllScripts(queryRef string) error {
+	return e.StopAllScriptsWithTrace(queryRef, "")
+}
+
+func (e *Engine) StopAllScriptsWithTrace(queryRef, traceID string) error {
+	e.appendLog("script.stop_all.requested", "info", "script stop_all requested", traceID, map[string]any{
+		"query_ref": queryRef,
+	})
 	targetEntries, err := e.resolveQueryRefEntries(queryRef)
 	if err != nil {
 		return err
 	}
 	if len(targetEntries) == 0 {
+		e.appendLog("script.stop_all.completed", "info", "script stop_all completed with no targets", traceID, map[string]any{
+			"query_ref": queryRef,
+		})
 		return nil
 	}
 	targets := make(map[string]struct{}, len(targetEntries))
@@ -176,14 +216,30 @@ func (e *Engine) StopAllScripts(queryRef string) error {
 		if !hasOverlap(targets, instTargets) {
 			continue
 		}
-		if err := e.StopScript(inst.Name, inst.QueryRef); err != nil {
+		e.appendLog("script.stop_all.match", "info", "script stop_all matched running instance", traceID, map[string]any{
+			"name":          inst.Name,
+			"query_ref":     inst.QueryRef,
+			"instance_hash": inst.Hash,
+		})
+		if err := e.StopScriptWithTrace(inst.Name, inst.QueryRef, traceID); err != nil {
 			return fmt.Errorf("stop script %s (%s): %w", inst.Name, inst.Hash, err)
 		}
 	}
+	e.appendLog("script.stop_all.completed", "info", "script stop_all completed", traceID, map[string]any{
+		"query_ref": queryRef,
+	})
 	return nil
 }
 
 func (e *Engine) Shutdown() {
+	if e.defWatcher != nil {
+		e.defWatcher.Stop()
+		e.defWatcher = nil
+	}
+	if e.defDeleteSub != nil {
+		e.defDeleteSub.Unsubscribe()
+		e.defDeleteSub = nil
+	}
 	e.mu.Lock()
 	toClose := make([]*luaVM, 0, len(e.instances))
 	for _, instVM := range e.instances {
@@ -194,6 +250,61 @@ func (e *Engine) Shutdown() {
 	for _, vm := range toClose {
 		vm.close()
 	}
+}
+
+func (e *Engine) startDefinitionWatcher(entries []storage.Entry) error {
+	watcher, err := storage.Watch(e.msg, storage.Query{Pattern: "sb-script.scripts.>"}, storage.WatchHandlers{
+		OnAdd: func(_ string, data json.RawMessage) {
+			e.reconcileDefinition(data, nil)
+		},
+		OnUpdate: func(_ string, data json.RawMessage) {
+			e.reconcileDefinition(data, nil)
+		},
+		OnRemove: func(_ string, data json.RawMessage) {
+			e.removeDefinition(data)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		watcher.Populate(entry.Key, entry.Data)
+	}
+	e.defWatcher = watcher
+	return nil
+}
+
+func (e *Engine) startDefinitionDeleteWatcher() error {
+	sub, err := e.msg.Subscribe("storage.delete", func(m *messenger.Message) {
+		var req struct {
+			Key    string                `json:"key"`
+			Target storage.StorageTarget `json:"target,omitempty"`
+		}
+		if err := json.Unmarshal(m.Data, &req); err != nil {
+			return
+		}
+		if req.Target != "" && req.Target != storage.State {
+			return
+		}
+		const defPrefix = "sb-script.scripts."
+		if !strings.HasPrefix(req.Key, defPrefix) {
+			return
+		}
+		name := strings.TrimPrefix(req.Key, defPrefix)
+		if name == "" {
+			return
+		}
+		e.removeDefinitionByName(name)
+	})
+	if err != nil {
+		return err
+	}
+	if err := e.msg.Flush(); err != nil {
+		sub.Unsubscribe()
+		return err
+	}
+	e.defDeleteSub = sub
+	return nil
 }
 
 func (e *Engine) ensureLayout() error {
@@ -259,14 +370,19 @@ func (e *Engine) startInstance(name, queryRef string) error {
 	// For Script() definitions (no trigger), invoke the function once immediately.
 	if rt.spec.trigger.kind == "" && rt.scriptFn != nil {
 		fn := rt.scriptFn
-		vm.enqueue(func() {
+		rt.initialInvocations = append(rt.initialInvocations, func() {
+			traceID := fmt.Sprintf("sb-script-trigger-%d", time.Now().UTC().UnixNano())
 			targets := rt.resolveTargets(rt.spec.targets)
 			rt.markFired(targets)
-			ctx := rt.newContext(targets, nil)
+			rt.log("script.invoke.started", "info", "script invoke started", traceID, nil)
+			ctx := rt.newContext(targets, nil, traceID)
 			if err := vm.L.CallByParam(lua.P{Fn: fn, NRet: 0, Protect: true}, ctx); err != nil {
 				rt.markError(err)
+				rt.log("script.invoke.failed", "error", "script invoke failed", traceID, map[string]any{"error": err.Error()})
 				slog.Warn("sb-script: Script callback error", "name", name, "err", err)
+				return
 			}
+			rt.log("script.invoke.completed", "info", "script invoke completed", traceID, nil)
 		})
 	}
 
@@ -303,6 +419,7 @@ func (e *Engine) definitionSource(name string) (string, bool) {
 		if json.Unmarshal(data, &def) == nil && def.Name != "" && def.Source != "" {
 			e.mu.Lock()
 			e.definitions[name] = def.Source
+			e.defTypes[name] = def.Type
 			e.mu.Unlock()
 			return def.Source, true
 		}
@@ -313,6 +430,7 @@ func (e *Engine) definitionSource(name string) (string, bool) {
 		if json.Unmarshal(entries[0].Data, &def) == nil && def.Name != "" && def.Source != "" {
 			e.mu.Lock()
 			e.definitions[name] = def.Source
+			e.defTypes[name] = def.Type
 			e.mu.Unlock()
 			return def.Source, true
 		}
@@ -322,6 +440,119 @@ func (e *Engine) definitionSource(name string) (string, bool) {
 	source, ok := e.definitions[name]
 	e.mu.RUnlock()
 	return source, ok && source != ""
+}
+
+func (e *Engine) reconcileDefinition(data json.RawMessage, _ *scriptstore.Definition) {
+	var def scriptstore.Definition
+	if err := json.Unmarshal(data, &def); err != nil {
+		return
+	}
+	if def.Name == "" {
+		return
+	}
+
+	e.mu.Lock()
+	prevSource, hadPrev := e.definitions[def.Name]
+	prevType := e.defTypes[def.Name]
+	e.definitions[def.Name] = def.Source
+	e.defTypes[def.Name] = def.Type
+	e.mu.Unlock()
+
+	if hadPrev && prevSource == def.Source && prevType == def.Type {
+		return
+	}
+
+	runningRefs := e.stopInstancesForDefinition(def.Name)
+	switch def.Type {
+	case "automation":
+		if len(runningRefs) == 0 {
+			runningRefs = []string{""}
+		} else if !containsString(runningRefs, "") {
+			runningRefs = append([]string{""}, runningRefs...)
+		}
+	case "script":
+		if len(runningRefs) == 0 {
+			return
+		}
+	default:
+		if len(runningRefs) == 0 {
+			return
+		}
+	}
+
+	for _, queryRef := range dedupeStrings(runningRefs) {
+		if err := e.startInstance(def.Name, queryRef); err != nil {
+			slog.Warn("sb-script: hot-reload start error", "name", def.Name, "queryRef", queryRef, "err", err)
+		}
+	}
+}
+
+func (e *Engine) removeDefinition(data json.RawMessage) {
+	var def scriptstore.Definition
+	if err := json.Unmarshal(data, &def); err != nil {
+		return
+	}
+	if def.Name == "" {
+		return
+	}
+	e.removeDefinitionByName(def.Name)
+}
+
+func (e *Engine) removeDefinitionByName(name string) {
+	e.mu.Lock()
+	delete(e.definitions, name)
+	delete(e.defTypes, name)
+	e.mu.Unlock()
+	e.stopInstancesForDefinition(name)
+}
+
+func (e *Engine) stopInstancesForDefinition(name string) []string {
+	e.mu.Lock()
+	type toStop struct {
+		hash string
+		vm   *luaVM
+	}
+	var (
+		stops     []toStop
+		queryRefs []string
+	)
+	for hash, instVM := range e.instances {
+		if instVM.record.Name != name {
+			continue
+		}
+		stops = append(stops, toStop{hash: hash, vm: instVM.vm})
+		queryRefs = append(queryRefs, instVM.record.QueryRef)
+		delete(e.instances, hash)
+	}
+	e.mu.Unlock()
+
+	for _, stop := range stops {
+		e.store.Delete(scriptstore.InstanceKey{Hash: stop.hash})
+		stop.vm.close()
+	}
+	return queryRefs
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func dedupeStrings(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
 }
 
 func (e *Engine) instanceRecord(hash string) *scriptstore.Instance {
@@ -439,18 +670,18 @@ type targetSpec struct {
 }
 
 type activationRuntime struct {
-	engine           *Engine
-	msg              messenger.Messenger
-	store            storage.Storage
-	vm               *luaVM
-	name             string
-	queryRef         string
-	queryOverride    *storage.Query
-	activated        bool
-	random           *rand.Rand
-	spec             automationSpec
-	scriptFn         *lua.LFunction
-	nextFireAt       *time.Time
+	engine             *Engine
+	msg                messenger.Messenger
+	store              storage.Storage
+	vm                 *luaVM
+	name               string
+	queryRef           string
+	queryOverride      *storage.Query
+	activated          bool
+	random             *rand.Rand
+	spec               automationSpec
+	scriptFn           *lua.LFunction
+	nextFireAt         *time.Time
 	initialInvocations []func() // enqueued after instance registration
 }
 
@@ -613,7 +844,16 @@ func (rt *activationRuntime) activate(spec automationSpec, fn *lua.LFunction) {
 			if err := json.Unmarshal(m.Data, &ent); err != nil {
 				return
 			}
-			rt.invoke(fn, spec, &ent)
+			traceID := messenger.TraceID(m.Headers)
+			if traceID == "" {
+				traceID = fmt.Sprintf("sb-script-trigger-%d", time.Now().UTC().UnixNano())
+			}
+			rt.log("automation.triggered", "info", "automation entity trigger received", traceID, map[string]any{
+				"trigger_kind": spec.trigger.kind,
+				"trigger_key":  spec.trigger.key,
+				"entity_key":   ent.Key(),
+			})
+			rt.invoke(fn, spec, &ent, traceID)
 		})
 		if err == nil {
 			rt.vm.subs = append(rt.vm.subs, sub)
@@ -624,7 +864,12 @@ func (rt *activationRuntime) activate(spec automationSpec, fn *lua.LFunction) {
 			if err := json.Unmarshal(data, &ent); err != nil {
 				return
 			}
-			rt.invoke(fn, spec, &ent)
+			traceID := fmt.Sprintf("sb-script-trigger-%d", time.Now().UTC().UnixNano())
+			rt.log("automation.triggered", "info", "automation query trigger received", traceID, map[string]any{
+				"trigger_kind": spec.trigger.kind,
+				"entity_key":   ent.Key(),
+			})
+			rt.invoke(fn, spec, &ent, traceID)
 		}
 		w, err := storage.Watch(rt.msg, spec.trigger.query, storage.WatchHandlers{
 			OnAdd:    invokeEntity,
@@ -649,20 +894,37 @@ func (rt *activationRuntime) activate(spec automationSpec, fn *lua.LFunction) {
 		}
 	case "interval":
 		rt.scheduleEvery(spec.trigger, func() {
-			rt.invoke(fn, spec, nil)
+			traceID := fmt.Sprintf("sb-script-trigger-%d", time.Now().UTC().UnixNano())
+			rt.log("automation.triggered", "info", "automation interval trigger fired", traceID, map[string]any{
+				"trigger_kind": spec.trigger.kind,
+			})
+			rt.invoke(fn, spec, nil, traceID)
 		})
 	}
 }
 
-func (rt *activationRuntime) invoke(fn *lua.LFunction, spec automationSpec, trigger *domain.Entity) {
+func (rt *activationRuntime) invoke(fn *lua.LFunction, spec automationSpec, trigger *domain.Entity, traceID string) {
 	targets := rt.resolveTargets(spec.targets)
 	rt.markFired(targets)
+	targetKeys := make([]string, 0, len(targets))
+	for _, target := range targets {
+		targetKeys = append(targetKeys, target.Key())
+	}
+	rt.log("automation.targets.resolved", "info", "automation targets resolved", traceID, map[string]any{
+		"target_kind":    spec.targets.kind,
+		"resolved_count": len(targets),
+		"resolved":       targetKeys,
+	})
 	rt.vm.enqueue(func() {
-		ctx := rt.newContext(targets, trigger)
+		rt.log("automation.invoke.started", "info", "automation invoke started", traceID, nil)
+		ctx := rt.newContext(targets, trigger, traceID)
 		if err := rt.vm.L.CallByParam(lua.P{Fn: fn, NRet: 0, Protect: true}, ctx); err != nil {
 			rt.markError(err)
+			rt.log("automation.invoke.failed", "error", "automation invoke failed", traceID, map[string]any{"error": err.Error()})
 			slog.Warn("sb-script: Automation callback error", "name", rt.name, "err", err)
+			return
 		}
+		rt.log("automation.invoke.completed", "info", "automation invoke completed", traceID, nil)
 	})
 }
 
@@ -694,7 +956,7 @@ func (rt *activationRuntime) resolveTargets(spec targetSpec) []domain.Entity {
 	}
 }
 
-func (rt *activationRuntime) newContext(targets []domain.Entity, trigger *domain.Entity) *lua.LTable {
+func (rt *activationRuntime) newContext(targets []domain.Entity, trigger *domain.Entity, traceID string) *lua.LTable {
 	L := rt.vm.L
 	ctx := L.NewTable()
 	L.SetField(ctx, "targets", entitiesToTable(L, targets))
@@ -733,6 +995,21 @@ func (rt *activationRuntime) newContext(targets []domain.Entity, trigger *domain
 		L.Push(entityToTable(L, entities[0]))
 		return 1
 	}))
+	L.SetField(ctx, "decision", L.NewFunction(func(L *lua.LState) int {
+		label := L.CheckString(1)
+		data := map[string]any{
+			"label": label,
+		}
+		if L.GetTop() >= 2 {
+			if tbl, ok := L.Get(2).(*lua.LTable); ok {
+				for k, v := range luaTableToMap(tbl) {
+					data[k] = v
+				}
+			}
+		}
+		rt.log("automation.decision", "info", "automation decision recorded", traceID, data)
+		return 0
+	}))
 	L.SetField(ctx, "send", L.NewFunction(func(L *lua.LState) int {
 		entityTbl := L.CheckTable(1)
 		action := L.CheckString(2)
@@ -744,17 +1021,25 @@ func (rt *activationRuntime) newContext(targets []domain.Entity, trigger *domain
 		}
 		if _, ok := domain.LookupCommand(action); !ok {
 			slog.Warn("sb-script: ctx.send unknown action, not published", "name", rt.name, "action", action)
+			rt.log("automation.command.rejected", "warn", "ctx.send action rejected", traceID, map[string]any{
+				"action": action,
+			})
 			return 0
 		}
 		key := lua.LVAsString(L.GetField(entityTbl, "key"))
-		_ = rt.msg.Publish(key+".command."+action, paramsJSON)
+		rt.log("automation.command.published", "info", "ctx.send published command", traceID, map[string]any{
+			"recipient": key,
+			"action":    action,
+		})
+		headers := messenger.WithOrigin(messenger.WithTraceID(nil, traceID), "sb-script", key, action)
+		_ = rt.msg.PublishWithHeaders(key+".command."+action, paramsJSON, headers)
 		return 0
 	}))
 	L.SetField(ctx, "after", L.NewFunction(func(L *lua.LState) int {
 		secs := float64(L.CheckNumber(1))
 		cb := L.CheckFunction(2)
 		id := rt.scheduleAfter(durationFromSecs(secs), func() {
-			child := rt.newContext(targets, trigger)
+			child := rt.newContext(targets, trigger, traceID)
 			if err := rt.vm.L.CallByParam(lua.P{Fn: cb, NRet: 0, Protect: true}, child); err != nil {
 				slog.Warn("sb-script: ctx.after callback error", "name", rt.name, "err", err)
 			}
@@ -766,7 +1051,7 @@ func (rt *activationRuntime) newContext(targets []domain.Entity, trigger *domain
 		secs := float64(L.CheckNumber(1))
 		cb := L.CheckFunction(2)
 		id := rt.scheduleEvery(triggerSpec{min: durationFromSecs(secs), max: durationFromSecs(secs)}, func() {
-			child := rt.newContext(targets, trigger)
+			child := rt.newContext(targets, trigger, traceID)
 			if err := rt.vm.L.CallByParam(lua.P{Fn: cb, NRet: 0, Protect: true}, child); err != nil {
 				slog.Warn("sb-script: ctx.every callback error", "name", rt.name, "err", err)
 			}
@@ -785,7 +1070,8 @@ func (rt *activationRuntime) newContext(targets []domain.Entity, trigger *domain
 		nameIndex, queryIndex := scriptControlArgIndexes(L)
 		name := L.CheckString(nameIndex)
 		queryRef := scriptControlQueryRef(L.Get(queryIndex))
-		if _, err := rt.engine.StartScript(name, queryRef); err != nil {
+		rt.log("script.control.start", "info", "ctx.scripts:start invoked", traceID, map[string]any{"target_name": name, "target_query_ref": queryRef})
+		if _, err := rt.engine.StartScriptWithTrace(name, queryRef, traceID); err != nil {
 			L.RaiseError("start script %q: %v", name, err)
 			return 0
 		}
@@ -795,7 +1081,8 @@ func (rt *activationRuntime) newContext(targets []domain.Entity, trigger *domain
 		nameIndex, queryIndex := scriptControlArgIndexes(L)
 		name := L.CheckString(nameIndex)
 		queryRef := scriptControlQueryRef(L.Get(queryIndex))
-		if err := rt.engine.StopScript(name, queryRef); err != nil {
+		rt.log("script.control.stop", "info", "ctx.scripts:stop invoked", traceID, map[string]any{"target_name": name, "target_query_ref": queryRef})
+		if err := rt.engine.StopScriptWithTrace(name, queryRef, traceID); err != nil {
 			L.RaiseError("stop script %q: %v", name, err)
 			return 0
 		}
@@ -803,7 +1090,8 @@ func (rt *activationRuntime) newContext(targets []domain.Entity, trigger *domain
 	}))
 	L.SetField(scriptsTbl, "stopAll", L.NewFunction(func(L *lua.LState) int {
 		queryRef := scriptControlQueryRef(L.Get(1))
-		if err := rt.engine.StopAllScripts(queryRef); err != nil {
+		rt.log("script.control.stop_all", "info", "ctx.scripts:stopAll invoked", traceID, map[string]any{"target_query_ref": queryRef})
+		if err := rt.engine.StopAllScriptsWithTrace(queryRef, traceID); err != nil {
 			L.RaiseError("stopAll %q: %v", queryRef, err)
 			return 0
 		}

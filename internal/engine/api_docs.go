@@ -117,6 +117,16 @@ func APIReferenceDoc() APIReference {
 				},
 			},
 			{
+				Name:        "ctx.decision",
+				Kind:        "context_method",
+				Signature:   "ctx.decision(label, data)",
+				Description: "Appends a structured decision/branch event to the automation log stream for the current trace.",
+				Params: []ParamDoc{
+					{Name: "label", Type: "string", Description: "Short branch/decision label such as any_on_true or ignored_falling_edge.", Required: true},
+					{Name: "data", Type: "table", Description: "Optional JSON-serializable fields explaining the decision."},
+				},
+			},
+			{
 				Name:        "ctx.send",
 				Kind:        "context_method",
 				Signature:   "ctx.send(entity, action, payload)",

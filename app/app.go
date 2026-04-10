@@ -6,6 +6,7 @@ import (
 	"log"
 
 	contract "github.com/slidebolt/sb-contract"
+	logging "github.com/slidebolt/sb-logging-sdk"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
 	server "github.com/slidebolt/sb-script/server"
 	storage "github.com/slidebolt/sb-storage-sdk"
@@ -45,7 +46,13 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 	}
 	a.sto = store
 
-	svc, err := server.New(msg, store)
+	var logger logging.Store
+	if logger, err = logging.Connect(deps); err != nil {
+		log.Printf("sb-script: logging connect failed: %v", err)
+		logger = nil
+	}
+
+	svc, err := server.NewWithLogger(msg, store, logger)
 	if err != nil {
 		return nil, err
 	}
