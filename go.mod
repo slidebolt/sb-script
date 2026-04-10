@@ -4,14 +4,14 @@ go 1.26.1
 
 require (
 	github.com/cucumber/godog v0.15.1
-	github.com/slidebolt/sb-contract v1.0.5
-	github.com/slidebolt/sb-domain v1.0.5
-	github.com/slidebolt/sb-logging v1.0.2
-	github.com/slidebolt/sb-logging-sdk v1.0.1
-	github.com/slidebolt/sb-messenger-sdk v1.0.6
-	github.com/slidebolt/sb-runtime v1.0.5
-	github.com/slidebolt/sb-storage-sdk v1.0.5
-	github.com/slidebolt/sb-storage-server v1.0.6
+	github.com/slidebolt/sb-contract v1.0.6
+	github.com/slidebolt/sb-domain v1.0.6
+	github.com/slidebolt/sb-logging v1.0.3
+	github.com/slidebolt/sb-logging-sdk v1.0.2
+	github.com/slidebolt/sb-messenger-sdk v1.0.7
+	github.com/slidebolt/sb-runtime v1.0.6
+	github.com/slidebolt/sb-storage-sdk v1.0.6
+	github.com/slidebolt/sb-storage-server v1.0.7
 	github.com/yuin/gopher-lua v1.1.1
 )
 
@@ -73,5 +73,3 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.48.2 // indirect
 )
-
-replace github.com/slidebolt/sb-logging-sdk => ../sb-logging-sdk
