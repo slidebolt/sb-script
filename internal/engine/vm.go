@@ -7,6 +7,23 @@ import (
 	"time"
 )
 
+type timer interface {
+	Stop() bool
+}
+
+type clock interface {
+	Now() time.Time
+	AfterFunc(time.Duration, func()) timer
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+func (realClock) AfterFunc(d time.Duration, fn func()) timer {
+	return time.AfterFunc(d, fn)
+}
+
 // vm is the base goroutine-safe VM wrapper.
 // One goroutine owns the work queue; all Lua execution happens there.
 type vm struct {
@@ -58,15 +75,15 @@ func (v *vm) stop() {
 // timerSet manages a set of cancellable timers.
 type timerSet struct {
 	mu      sync.Mutex
-	timers  map[int64]*time.Timer
+	timers  map[int64]timer
 	counter int64
 }
 
 func newTimerSet() *timerSet {
-	return &timerSet{timers: make(map[int64]*time.Timer)}
+	return &timerSet{timers: make(map[int64]timer)}
 }
 
-func (ts *timerSet) add(t *time.Timer) int64 {
+func (ts *timerSet) add(t timer) int64 {
 	id := atomic.AddInt64(&ts.counter, 1)
 	ts.mu.Lock()
 	ts.timers[id] = t
@@ -92,6 +109,6 @@ func (ts *timerSet) cancelAll() {
 	for _, t := range ts.timers {
 		t.Stop()
 	}
-	ts.timers = make(map[int64]*time.Timer)
+	ts.timers = make(map[int64]timer)
 	ts.mu.Unlock()
 }

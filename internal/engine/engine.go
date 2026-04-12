@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	cron "github.com/robfig/cron/v3"
 	domain "github.com/slidebolt/sb-domain"
 	logging "github.com/slidebolt/sb-logging-sdk"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
@@ -29,6 +30,7 @@ type Engine struct {
 	instances    map[string]*persistedInstance // hash(name+query) -> active automation VM
 	defWatcher   *storage.Watcher
 	defDeleteSub messenger.Subscription
+	clock        clock
 }
 
 type persistedInstance struct {
@@ -48,10 +50,21 @@ func (w watcherSubscription) Unsubscribe() error {
 }
 
 func New(msg messenger.Messenger, store storage.Storage) (*Engine, error) {
-	return NewWithLogger(msg, store, nil)
+	return NewWithClock(msg, store, nil)
 }
 
 func NewWithLogger(msg messenger.Messenger, store storage.Storage, logger logging.Store) (*Engine, error) {
+	return NewWithClock(msg, store, logger)
+}
+
+func NewWithClock(msg messenger.Messenger, store storage.Storage, logger logging.Store) (*Engine, error) {
+	return newEngine(msg, store, logger, realClock{})
+}
+
+func newEngine(msg messenger.Messenger, store storage.Storage, logger logging.Store, clk clock) (*Engine, error) {
+	if clk == nil {
+		clk = realClock{}
+	}
 	e := &Engine{
 		msg:         msg,
 		store:       store,
@@ -59,6 +72,7 @@ func NewWithLogger(msg messenger.Messenger, store storage.Storage, logger loggin
 		definitions: make(map[string]string),
 		defTypes:    make(map[string]string),
 		instances:   make(map[string]*persistedInstance),
+		clock:       clk,
 	}
 
 	if err := e.ensureLayout(); err != nil {
@@ -337,7 +351,7 @@ func (e *Engine) startInstance(name, queryRef string) error {
 		queryOverride = &resolved
 	}
 
-	vm := newLuaVM()
+	vm := newLuaVM(e.clock)
 	vm.injectServices(e.msg, e.store, e)
 
 	rt := &activationRuntime{
@@ -348,7 +362,7 @@ func (e *Engine) startInstance(name, queryRef string) error {
 		name:          name,
 		queryRef:      queryRef,
 		queryOverride: queryOverride,
-		random:        rand.New(rand.NewSource(time.Now().UnixNano())),
+		random:        rand.New(rand.NewSource(e.clock.Now().UnixNano())),
 	}
 	rt.injectAutomationAPI()
 
@@ -371,7 +385,7 @@ func (e *Engine) startInstance(name, queryRef string) error {
 	if rt.spec.trigger.kind == "" && rt.scriptFn != nil {
 		fn := rt.scriptFn
 		rt.initialInvocations = append(rt.initialInvocations, func() {
-			traceID := fmt.Sprintf("sb-script-trigger-%d", time.Now().UTC().UnixNano())
+			traceID := fmt.Sprintf("sb-script-trigger-%d", e.clock.Now().UTC().UnixNano())
 			targets := rt.resolveTargets(rt.spec.targets)
 			rt.markFired(targets)
 			rt.log("script.invoke.started", "info", "script invoke started", traceID, nil)
@@ -394,7 +408,7 @@ func (e *Engine) startInstance(name, queryRef string) error {
 		Status:    "running",
 		Trigger:   triggerInfo(rt.spec.trigger),
 		Targets:   targetInfo(rt.spec.targets),
-		StartedAt: timePtr(time.Now()),
+		StartedAt: timePtr(e.clock.Now()),
 	}
 	if rt.nextFireAt != nil {
 		record.NextFireAt = timePtr(*rt.nextFireAt)
@@ -660,6 +674,8 @@ type triggerSpec struct {
 	query    storage.Query
 	min      time.Duration
 	max      time.Duration
+	expr     string
+	schedule cron.Schedule
 }
 
 type targetSpec struct {
@@ -749,6 +765,14 @@ func (rt *activationRuntime) injectAutomationAPI() {
 		return 1
 	}))
 
+	L.SetGlobal("Cron", L.NewFunction(func(L *lua.LState) int {
+		tbl := L.NewTable()
+		L.SetField(tbl, "kind", lua.LString("cron"))
+		L.SetField(tbl, "expr", lua.LString(L.CheckString(1)))
+		L.Push(tbl)
+		return 1
+	}))
+
 	L.SetGlobal("Automation", L.NewFunction(func(L *lua.LState) int {
 		name := L.CheckString(1)
 		specTbl := L.CheckTable(2)
@@ -756,7 +780,11 @@ func (rt *activationRuntime) injectAutomationAPI() {
 		if name != rt.name {
 			return 0
 		}
-		spec := parseAutomationSpec(L, specTbl, rt.queryRef, rt.queryOverride)
+		spec, err := parseAutomationSpec(L, specTbl, rt.queryRef, rt.queryOverride)
+		if err != nil {
+			L.RaiseError("automation spec: %v", err)
+			return 0
+		}
 		rt.spec = spec
 		rt.activate(spec, fn)
 		rt.activated = true
@@ -785,22 +813,26 @@ func (rt *activationRuntime) injectAutomationAPI() {
 	}))
 }
 
-func parseAutomationSpec(L *lua.LState, specTbl *lua.LTable, queryRef string, queryOverride *storage.Query) automationSpec {
+func parseAutomationSpec(L *lua.LState, specTbl *lua.LTable, queryRef string, queryOverride *storage.Query) (automationSpec, error) {
 	spec := automationSpec{
 		targets: targetSpec{kind: "none"},
 	}
 	if trg, ok := L.GetField(specTbl, "trigger").(*lua.LTable); ok {
-		spec.trigger = parseTriggerSpec(L, trg)
+		trigger, err := parseTriggerSpec(L, trg)
+		if err != nil {
+			return automationSpec{}, err
+		}
+		spec.trigger = trigger
 	}
 	if queryOverride != nil {
 		spec.targets = targetSpec{kind: "query_ref", queryRef: queryRef, query: *queryOverride}
 	} else if tgt, ok := L.GetField(specTbl, "targets").(*lua.LTable); ok {
 		spec.targets = parseTargetSpec(L, tgt)
 	}
-	return spec
+	return spec, nil
 }
 
-func parseTriggerSpec(L *lua.LState, tbl *lua.LTable) triggerSpec {
+func parseTriggerSpec(L *lua.LState, tbl *lua.LTable) (triggerSpec, error) {
 	spec := triggerSpec{kind: lua.LVAsString(L.GetField(tbl, "kind"))}
 	spec.key = lua.LVAsString(L.GetField(tbl, "key"))
 	spec.queryRef = lua.LVAsString(L.GetField(tbl, "queryRef"))
@@ -810,14 +842,53 @@ func parseTriggerSpec(L *lua.LState, tbl *lua.LTable) triggerSpec {
 			spec.query = query
 		}
 	}
-	if spec.kind == "interval" {
+	switch spec.kind {
+	case "interval":
 		spec.min = durationFromSecs(float64(lua.LVAsNumber(L.GetField(tbl, "min"))))
 		spec.max = durationFromSecs(float64(lua.LVAsNumber(L.GetField(tbl, "max"))))
 		if spec.max < spec.min {
 			spec.max = spec.min
 		}
+	case "cron":
+		spec.expr = lua.LVAsString(L.GetField(tbl, "expr"))
+		schedule, err := parseCronSchedule(spec.expr)
+		if err != nil {
+			return triggerSpec{}, err
+		}
+		spec.schedule = schedule
 	}
-	return spec
+	return spec, nil
+}
+
+func parseCronSchedule(expr string) (cron.Schedule, error) {
+	parser := cron.NewParser(
+		cron.Minute |
+			cron.Hour |
+			cron.Dom |
+			cron.Month |
+			cron.Dow |
+			cron.Descriptor,
+	)
+	return parser.Parse(expr)
+}
+
+func (spec triggerSpec) next(now time.Time) (time.Time, error) {
+	switch spec.kind {
+	case "interval":
+		return now.Add(spec.min), nil
+	case "cron":
+		schedule := spec.schedule
+		if schedule == nil {
+			parsed, err := parseCronSchedule(spec.expr)
+			if err != nil {
+				return time.Time{}, err
+			}
+			schedule = parsed
+		}
+		return schedule.Next(now), nil
+	default:
+		return time.Time{}, fmt.Errorf("unsupported trigger kind %q", spec.kind)
+	}
 }
 
 func parseTargetSpec(L *lua.LState, tbl *lua.LTable) targetSpec {
@@ -846,7 +917,7 @@ func (rt *activationRuntime) activate(spec automationSpec, fn *lua.LFunction) {
 			}
 			traceID := messenger.TraceID(m.Headers)
 			if traceID == "" {
-				traceID = fmt.Sprintf("sb-script-trigger-%d", time.Now().UTC().UnixNano())
+				traceID = fmt.Sprintf("sb-script-trigger-%d", rt.engine.clock.Now().UTC().UnixNano())
 			}
 			rt.log("automation.triggered", "info", "automation entity trigger received", traceID, map[string]any{
 				"trigger_kind": spec.trigger.kind,
@@ -864,7 +935,7 @@ func (rt *activationRuntime) activate(spec automationSpec, fn *lua.LFunction) {
 			if err := json.Unmarshal(data, &ent); err != nil {
 				return
 			}
-			traceID := fmt.Sprintf("sb-script-trigger-%d", time.Now().UTC().UnixNano())
+			traceID := fmt.Sprintf("sb-script-trigger-%d", rt.engine.clock.Now().UTC().UnixNano())
 			rt.log("automation.triggered", "info", "automation query trigger received", traceID, map[string]any{
 				"trigger_kind": spec.trigger.kind,
 				"entity_key":   ent.Key(),
@@ -894,9 +965,18 @@ func (rt *activationRuntime) activate(spec automationSpec, fn *lua.LFunction) {
 		}
 	case "interval":
 		rt.scheduleEvery(spec.trigger, func() {
-			traceID := fmt.Sprintf("sb-script-trigger-%d", time.Now().UTC().UnixNano())
+			traceID := fmt.Sprintf("sb-script-trigger-%d", rt.engine.clock.Now().UTC().UnixNano())
 			rt.log("automation.triggered", "info", "automation interval trigger fired", traceID, map[string]any{
 				"trigger_kind": spec.trigger.kind,
+			})
+			rt.invoke(fn, spec, nil, traceID)
+		})
+	case "cron":
+		rt.scheduleCron(spec.trigger, func() {
+			traceID := fmt.Sprintf("sb-script-trigger-%d", rt.engine.clock.Now().UTC().UnixNano())
+			rt.log("automation.triggered", "info", "automation cron trigger fired", traceID, map[string]any{
+				"trigger_kind": spec.trigger.kind,
+				"trigger_expr": spec.trigger.expr,
 			})
 			rt.invoke(fn, spec, nil, traceID)
 		})
@@ -1121,7 +1201,7 @@ func scriptControlQueryRef(v lua.LValue) string {
 
 func (rt *activationRuntime) scheduleAfter(d time.Duration, fn func()) int64 {
 	var id int64
-	t := time.AfterFunc(d, func() {
+	t := rt.engine.clock.AfterFunc(d, func() {
 		rt.vm.timers.cancel(id)
 		rt.vm.enqueue(fn)
 	})
@@ -1137,12 +1217,47 @@ func (rt *activationRuntime) scheduleEvery(spec triggerSpec, fn func()) int64 {
 		if spec.max > spec.min {
 			delay += time.Duration(rt.random.Int63n(int64(spec.max - spec.min)))
 		}
-		next := time.Now().Add(delay)
+		next := rt.engine.clock.Now().Add(delay)
 		rt.nextFireAt = &next
 		rt.engine.saveInstanceRecord(rt.instanceHash(), func(inst *scriptstore.Instance) {
 			inst.NextFireAt = timePtr(next)
 		})
-		t := time.AfterFunc(delay, func() {
+		t := rt.engine.clock.AfterFunc(delay, func() {
+			rt.vm.timers.cancel(id)
+			rt.vm.enqueue(func() {
+				fn()
+				select {
+				case <-rt.vm.done:
+				default:
+					schedule()
+				}
+			})
+		})
+		id = rt.vm.timers.add(t)
+	}
+	schedule()
+	return id
+}
+
+func (rt *activationRuntime) scheduleCron(spec triggerSpec, fn func()) int64 {
+	var id int64
+	var schedule func()
+	schedule = func() {
+		next, err := spec.next(rt.engine.clock.Now())
+		if err != nil {
+			rt.markError(err)
+			slog.Warn("sb-script: cron schedule error", "name", rt.name, "expr", spec.expr, "err", err)
+			return
+		}
+		rt.nextFireAt = &next
+		rt.engine.saveInstanceRecord(rt.instanceHash(), func(inst *scriptstore.Instance) {
+			inst.NextFireAt = timePtr(next)
+		})
+		delay := next.Sub(rt.engine.clock.Now())
+		if delay < 0 {
+			delay = 0
+		}
+		t := rt.engine.clock.AfterFunc(delay, func() {
 			rt.vm.timers.cancel(id)
 			rt.vm.enqueue(func() {
 				fn()
@@ -1164,7 +1279,7 @@ func (rt *activationRuntime) instanceHash() string {
 }
 
 func (rt *activationRuntime) markFired(targets []domain.Entity) {
-	now := time.Now()
+	now := rt.engine.clock.Now()
 	keys := make([]string, 0, len(targets))
 	for _, target := range targets {
 		keys = append(keys, target.Key())
@@ -1172,6 +1287,7 @@ func (rt *activationRuntime) markFired(targets []domain.Entity) {
 	rt.engine.saveInstanceRecord(rt.instanceHash(), func(inst *scriptstore.Instance) {
 		inst.Status = "running"
 		inst.LastFiredAt = timePtr(now)
+		inst.NextFireAt = nil
 		inst.ResolvedTargets = keys
 		inst.LastError = ""
 		inst.FireCount++
@@ -1191,6 +1307,7 @@ func triggerInfo(spec triggerSpec) scriptstore.TriggerInfo {
 		Query:      queryIdentity(spec.query),
 		MinSeconds: spec.min.Seconds(),
 		MaxSeconds: spec.max.Seconds(),
+		Expr:       spec.expr,
 	}
 }
 

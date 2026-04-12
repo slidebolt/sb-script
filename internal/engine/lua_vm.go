@@ -23,13 +23,18 @@ type luaVM struct {
 	timers    *timerSet
 	subs      []messenger.Subscription
 	closeOnce sync.Once
+	clock     clock
 }
 
-func newLuaVM() *luaVM {
+func newLuaVM(clk clock) *luaVM {
+	if clk == nil {
+		clk = realClock{}
+	}
 	return &luaVM{
 		vm:     newVM(),
 		L:      lua.NewState(),
 		timers: newTimerSet(),
+		clock:  clk,
 	}
 }
 
@@ -128,7 +133,7 @@ func (lv *luaVM) injectServices(msg messenger.Messenger, store storage.Storage, 
 		fn := L.CheckFunction(2)
 		dur := durationFromSecs(secs)
 		var id int64
-		t := time.AfterFunc(dur, func() {
+		t := lv.clock.AfterFunc(dur, func() {
 			lv.timers.cancel(id)
 			lv.enqueue(func() {
 				if err := L.CallByParam(lua.P{Fn: fn, NRet: 0, Protect: true}); err != nil {
@@ -147,7 +152,7 @@ func (lv *luaVM) injectServices(msg messenger.Messenger, store storage.Storage, 
 		var id int64
 		var schedule func()
 		schedule = func() {
-			t := time.AfterFunc(dur, func() {
+			t := lv.clock.AfterFunc(dur, func() {
 				lv.timers.cancel(id)
 				lv.enqueue(func() {
 					if err := L.CallByParam(lua.P{Fn: fn, NRet: 0, Protect: true}); err != nil {
@@ -156,7 +161,7 @@ func (lv *luaVM) injectServices(msg messenger.Messenger, store storage.Storage, 
 					select {
 					case <-lv.vm.done:
 					default:
-						t2 := time.AfterFunc(dur, func() {
+						t2 := lv.clock.AfterFunc(dur, func() {
 							lv.enqueue(func() {
 								schedule()
 							})

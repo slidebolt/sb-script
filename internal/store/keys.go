@@ -117,6 +117,7 @@ type TriggerInfo struct {
 	Query      string  `json:"query,omitempty"`
 	MinSeconds float64 `json:"minSeconds,omitempty"`
 	MaxSeconds float64 `json:"maxSeconds,omitempty"`
+	Expr       string  `json:"expr,omitempty"`
 }
 
 type TargetInfo struct {
