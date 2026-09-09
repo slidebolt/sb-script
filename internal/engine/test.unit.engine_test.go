@@ -1691,6 +1691,156 @@ end)`
 	}
 }
 
+func TestAutomationButtonBurstEmitsOneCommand(t *testing.T) {
+	msg, err := messenger.Mock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Close()
+
+	store, err := storageserver.Mock(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	group := domain.Entity{
+		ID:       "alexroom",
+		Plugin:   "plugin-automation",
+		DeviceID: "group",
+		Type:     "light",
+		Name:     "AlexRoom",
+		State:    domain.Light{Power: true, Brightness: 100},
+	}
+	if err := store.Save(group); err != nil {
+		t.Fatal(err)
+	}
+	for _, ent := range []domain.Entity{
+		{ID: "up", Plugin: "plugin-esphome", DeviceID: "alex_room_switch", Type: "binary_sensor", Name: "Button Up", State: domain.BinarySensor{On: false}},
+		{ID: "down", Plugin: "plugin-esphome", DeviceID: "alex_room_switch", Type: "binary_sensor", Name: "Button Down", State: domain.BinarySensor{On: false}},
+	} {
+		if err := store.Save(ent); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	published := make(chan []byte, 4)
+	if _, err := msg.Subscribe("plugin-automation.group.alexroom.command.light_set_brightness", func(m *messenger.Message) {
+		published <- m.Data
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := msg.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	engine, err := New(msg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Shutdown()
+
+	source := `local settling = false
+local cooldown = false
+local pending_key = nil
+
+local SETTLE_SECONDS = 0.05
+local COOLDOWN_SECONDS = 0.30
+local STEP = 32
+local BUTTON_UP = "plugin-esphome.alex_room_switch.up"
+local BUTTON_DOWN = "plugin-esphome.alex_room_switch.down"
+
+local function rising_edge(ctx)
+  return ctx.trigger and ctx.trigger.entity and ctx.trigger.entity.state and ctx.trigger.entity.state.on == true
+end
+
+local function execute(ctx, key)
+  local group = ctx.queryOne("plugin-automation.group.alexroom")
+  if key == BUTTON_UP then
+    ctx.send(group, "light_set_brightness", { brightness = group.state.brightness + STEP })
+  elseif key == BUTTON_DOWN then
+    ctx.send(group, "light_set_brightness", { brightness = group.state.brightness - STEP })
+  end
+end
+
+Automation("BurstSwitch", {
+  trigger = Query({
+    pattern = "plugin-esphome.alex_room_switch.*",
+    where = {
+      { field = "type", op = "eq", value = "binary_sensor" }
+    }
+  }),
+  targets = None()
+}, function(ctx)
+  if not rising_edge(ctx) then
+    return
+  end
+  if cooldown then
+    ctx.decision("ignored_cooldown", { button = ctx.trigger.entity.key })
+    return
+  end
+  if settling then
+    ctx.decision("ignored_settle", { button = ctx.trigger.entity.key, pending = pending_key })
+    return
+  end
+  settling = true
+  pending_key = ctx.trigger.entity.key
+  ctx.after(SETTLE_SECONDS, function(step)
+    local action_key = pending_key
+    pending_key = nil
+    settling = false
+    execute(step, action_key)
+    cooldown = true
+    step.after(COOLDOWN_SECONDS, function()
+      cooldown = false
+    end)
+  end)
+end)`
+	if err := saveDefinition(t, store, "BurstSwitch", source); err != nil {
+		t.Fatal(err)
+	}
+
+	hash, err := engine.StartScript("BurstSwitch", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForInstance(t, store, hash, func(inst scriptstore.Instance) bool {
+		return inst.FireCount >= 2
+	})
+
+	if err := store.Save(domain.Entity{ID: "up", Plugin: "plugin-esphome", DeviceID: "alex_room_switch", Type: "binary_sensor", Name: "Button Up", State: domain.BinarySensor{On: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(domain.Entity{ID: "down", Plugin: "plugin-esphome", DeviceID: "alex_room_switch", Type: "binary_sensor", Name: "Button Down", State: domain.BinarySensor{On: true}}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := store.Save(domain.Entity{ID: "down", Plugin: "plugin-esphome", DeviceID: "alex_room_switch", Type: "binary_sensor", Name: "Button Down", State: domain.BinarySensor{On: true}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var commands [][]byte
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case data := <-published:
+			commands = append(commands, data)
+		case <-deadline:
+			if len(commands) != 1 {
+				t.Fatalf("commands: got %d want 1", len(commands))
+			}
+			var cmd domain.LightSetBrightness
+			if err := json.Unmarshal(commands[0], &cmd); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if cmd.Brightness != 132 {
+				t.Fatalf("brightness: got %d want 132", cmd.Brightness)
+			}
+			return
+		}
+	}
+}
+
 func TestCtxDecision_AppendsStructuredDecisionLog(t *testing.T) {
 	msg, err := messenger.Mock()
 	if err != nil {
