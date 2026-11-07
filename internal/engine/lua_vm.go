@@ -132,16 +132,16 @@ func (lv *luaVM) injectServices(msg messenger.Messenger, store storage.Storage, 
 		secs := float64(L.CheckNumber(1))
 		fn := L.CheckFunction(2)
 		dur := durationFromSecs(secs)
-		var id int64
+		id := lv.timers.reserve()
 		t := lv.clock.AfterFunc(dur, func() {
-			lv.timers.cancel(id)
+			lv.timers.done(id)
 			lv.enqueue(func() {
 				if err := L.CallByParam(lua.P{Fn: fn, NRet: 0, Protect: true}); err != nil {
 					slog.Warn("sb-script: TimerService.After callback error", "err", err)
 				}
 			})
 		})
-		id = lv.timers.add(t)
+		lv.timers.set(id, t)
 		L.Push(lua.LNumber(id))
 		return 1
 	}))
@@ -149,11 +149,11 @@ func (lv *luaVM) injectServices(msg messenger.Messenger, store storage.Storage, 
 		secs := float64(L.CheckNumber(1))
 		fn := L.CheckFunction(2)
 		dur := durationFromSecs(secs)
-		var id int64
+		// One ID for the timer's whole life, so Cancel stops it at any point.
+		id := lv.timers.reserve()
 		var schedule func()
 		schedule = func() {
 			t := lv.clock.AfterFunc(dur, func() {
-				lv.timers.cancel(id)
 				lv.enqueue(func() {
 					if err := L.CallByParam(lua.P{Fn: fn, NRet: 0, Protect: true}); err != nil {
 						slog.Warn("sb-script: TimerService.Every callback error", "err", err)
@@ -161,16 +161,11 @@ func (lv *luaVM) injectServices(msg messenger.Messenger, store storage.Storage, 
 					select {
 					case <-lv.vm.done:
 					default:
-						t2 := lv.clock.AfterFunc(dur, func() {
-							lv.enqueue(func() {
-								schedule()
-							})
-						})
-						id = lv.timers.add(t2)
+						schedule()
 					}
 				})
 			})
-			id = lv.timers.add(t)
+			lv.timers.set(id, t)
 		}
 		schedule()
 		L.Push(lua.LNumber(id))

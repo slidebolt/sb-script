@@ -417,13 +417,18 @@ func (e *Engine) startInstance(name, queryRef string) error {
 	e.instances[hash] = &persistedInstance{vm: vm, record: record}
 	e.mu.Unlock()
 
+	// Save the initial record before any invocation can run. markFired saves the
+	// record too, from the VM goroutine; saving this one afterwards would
+	// overwrite its FireCount with zero.
+	saveErr := e.store.Save(record)
+
 	// Enqueue initial invocations AFTER the instance is registered so that
 	// markFired can find the record when these run on the VM goroutine.
 	for _, fn := range rt.initialInvocations {
 		vm.enqueue(fn)
 	}
 
-	return e.store.Save(record)
+	return saveErr
 }
 
 func (e *Engine) definitionSource(name string) (string, bool) {
@@ -1200,17 +1205,17 @@ func scriptControlQueryRef(v lua.LValue) string {
 }
 
 func (rt *activationRuntime) scheduleAfter(d time.Duration, fn func()) int64 {
-	var id int64
+	id := rt.vm.timers.reserve()
 	t := rt.engine.clock.AfterFunc(d, func() {
-		rt.vm.timers.cancel(id)
+		rt.vm.timers.done(id)
 		rt.vm.enqueue(fn)
 	})
-	id = rt.vm.timers.add(t)
+	rt.vm.timers.set(id, t)
 	return id
 }
 
 func (rt *activationRuntime) scheduleEvery(spec triggerSpec, fn func()) int64 {
-	var id int64
+	id := rt.vm.timers.reserve()
 	var schedule func()
 	schedule = func() {
 		delay := spec.min
@@ -1223,7 +1228,6 @@ func (rt *activationRuntime) scheduleEvery(spec triggerSpec, fn func()) int64 {
 			inst.NextFireAt = timePtr(next)
 		})
 		t := rt.engine.clock.AfterFunc(delay, func() {
-			rt.vm.timers.cancel(id)
 			rt.vm.enqueue(func() {
 				fn()
 				select {
@@ -1233,14 +1237,14 @@ func (rt *activationRuntime) scheduleEvery(spec triggerSpec, fn func()) int64 {
 				}
 			})
 		})
-		id = rt.vm.timers.add(t)
+		rt.vm.timers.set(id, t)
 	}
 	schedule()
 	return id
 }
 
 func (rt *activationRuntime) scheduleCron(spec triggerSpec, fn func()) int64 {
-	var id int64
+	id := rt.vm.timers.reserve()
 	var schedule func()
 	schedule = func() {
 		next, err := spec.next(rt.engine.clock.Now())
@@ -1258,7 +1262,6 @@ func (rt *activationRuntime) scheduleCron(spec triggerSpec, fn func()) int64 {
 			delay = 0
 		}
 		t := rt.engine.clock.AfterFunc(delay, func() {
-			rt.vm.timers.cancel(id)
 			rt.vm.enqueue(func() {
 				fn()
 				select {
@@ -1268,7 +1271,7 @@ func (rt *activationRuntime) scheduleCron(spec triggerSpec, fn func()) int64 {
 				}
 			})
 		})
-		id = rt.vm.timers.add(t)
+		rt.vm.timers.set(id, t)
 	}
 	schedule()
 	return id
