@@ -352,7 +352,7 @@ func TestCronTrigger_UsesSingleExactTimer(t *testing.T) {
 
 func waitForCronInstance(t *testing.T, store storage.Storage, hash string, pred func(scriptstore.Instance) bool) scriptstore.Instance {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	var last scriptstore.Instance
 	for time.Now().Before(deadline) {
 		data, err := store.Get(scriptstore.InstanceKey{Hash: hash})

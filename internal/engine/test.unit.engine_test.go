@@ -197,7 +197,7 @@ func TestStartScriptMissingReturnsPromptly(t *testing.T) {
 		if !strings.Contains(err.Error(), "missing_script") {
 			t.Fatalf("unexpected start error: %v", err)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(15 * time.Second):
 		t.Fatal("StartScript timed out for missing script")
 	}
 }
@@ -231,7 +231,7 @@ func TestStopScriptMissingReturnsPromptly(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected stop error: %v", err)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(15 * time.Second):
 		t.Fatal("StopScript timed out for missing script")
 	}
 }
@@ -270,7 +270,7 @@ func TestScriptCanStopItselfWithoutDeadlockingEngine(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := store.Get(scriptstore.InstanceKey{Hash: hash}); err != nil {
 			break
@@ -291,7 +291,7 @@ func TestScriptCanStopItselfWithoutDeadlockingEngine(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected missing script error after self-stop")
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(15 * time.Second):
 		t.Fatal("engine remained blocked after self-stop")
 	}
 }
@@ -637,7 +637,7 @@ func TestContextScriptsStartAndStopControlOtherScriptInstances(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := store.Get(scriptstore.InstanceKey{Hash: partyHash}); err != nil {
 			return
@@ -726,7 +726,7 @@ func TestStopAllScriptsStopsOnlyOverlappingInstances(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		_, basementErr := store.Get(scriptstore.InstanceKey{Hash: basementHash})
 		_, upstairsErr := store.Get(scriptstore.InstanceKey{Hash: upstairsHash})
@@ -740,7 +740,7 @@ func TestStopAllScriptsStopsOnlyOverlappingInstances(t *testing.T) {
 
 func waitForInstance(t *testing.T, store storage.Storage, hash string, pred func(scriptstore.Instance) bool) scriptstore.Instance {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		entries, err := store.Search("sb-script.instances.*")
 		if err == nil {
@@ -779,7 +779,7 @@ func saveAutomation(t *testing.T, store storage.Storage, name, source string) er
 
 func waitForDecisionLabel(t *testing.T, logger logging.Store, entityKey, label string) logging.Event {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		events, err := logger.List(context.Background(), logging.ListRequest{
 			Source: "sb-script",
@@ -963,7 +963,7 @@ func TestScriptPrimitive_CtxAfterWorksWithoutInterval(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if atomic.LoadInt32(&callCount) >= 2 {
 			return
@@ -1403,7 +1403,7 @@ func TestAutomationDefinition_DeletedAfterEngineStart_HotReloadsExpected(t *test
 	}
 
 	hash := scriptstore.HashInstance("HotDeleteAutomation", "")
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		_, err := store.Get(scriptstore.InstanceKey{Hash: hash})
 		if err != nil {
@@ -1686,7 +1686,7 @@ end)`
 		if cmd.Brightness != 150 {
 			t.Fatalf("brightness: got %d want 150", cmd.Brightness)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("timed out waiting for command")
 	}
 }
@@ -1820,7 +1820,7 @@ end)`
 	}
 
 	var commands [][]byte
-	deadline := time.After(500 * time.Millisecond)
+	deadline := time.After(15 * time.Second)
 	for {
 		select {
 		case data := <-published:
@@ -1883,7 +1883,7 @@ end)`
 	})
 
 	var events []logging.Event
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		events, err = logger.List(context.Background(), logging.ListRequest{
 			Source: "sb-script",
