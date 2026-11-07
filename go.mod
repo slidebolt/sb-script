@@ -6,7 +6,7 @@ require (
 	github.com/cucumber/godog v0.15.1
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/slidebolt/sb-contract v1.0.6
-	github.com/slidebolt/sb-domain v1.0.15
+	github.com/slidebolt/sb-domain v1.0.16
 	github.com/slidebolt/sb-logging v1.0.6
 	github.com/slidebolt/sb-logging-sdk v1.0.9
 	github.com/slidebolt/sb-messenger-sdk v1.0.8
