@@ -413,9 +413,19 @@ func (e *Engine) startInstance(name, queryRef string) error {
 	if rt.nextFireAt != nil {
 		record.NextFireAt = timePtr(*rt.nextFireAt)
 	}
+	// One instance per hash. A start can race with another, such as saving an
+	// automation (which starts it) and an explicit start, so the newer one replaces
+	// the older. Without closing it, the older VM would keep reacting to triggers
+	// while no longer being listed or stoppable.
 	e.mu.Lock()
+	prev := e.instances[hash]
 	e.instances[hash] = &persistedInstance{vm: vm, record: record}
 	e.mu.Unlock()
+	if prev != nil && prev.vm != vm {
+		// Asynchronously, as StopScript does: this may run on prev's own goroutine,
+		// when a script starts itself.
+		go prev.vm.close()
+	}
 
 	// Save the initial record before any invocation can run. markFired saves the
 	// record too, from the VM goroutine; saving this one afterwards would
