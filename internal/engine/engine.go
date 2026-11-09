@@ -1242,7 +1242,12 @@ func (rt *activationRuntime) newContext(targets []domain.Entity, trigger *domain
 		return 0
 	}))
 	L.SetField(scriptsTbl, "stopAll", L.NewFunction(func(L *lua.LState) int {
-		queryRef := scriptControlQueryRef(L.Get(1))
+		// ctx.scripts:stopAll(ref) passes the scripts table first.
+		queryIndex := 1
+		if _, ok := L.Get(1).(*lua.LTable); ok && L.GetTop() >= 2 {
+			queryIndex = 2
+		}
+		queryRef := scriptControlQueryRef(L.Get(queryIndex))
 		rt.log("script.control.stop_all", "info", "ctx.scripts:stopAll invoked", traceID, map[string]any{"target_query_ref": queryRef})
 		if err := rt.engine.StopAllScriptsWithTrace(queryRef, traceID); err != nil {
 			L.RaiseError("stopAll %q: %v", queryRef, err)
