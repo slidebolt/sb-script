@@ -141,6 +141,13 @@ func (ts *timerSet) cancel(id int64) bool {
 	return false
 }
 
+// pending counts timers that have not fired or been cancelled.
+func (ts *timerSet) pending() int {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return len(ts.timers)
+}
+
 func (ts *timerSet) cancelAll() {
 	ts.mu.Lock()
 	for id, t := range ts.timers {

@@ -31,10 +31,19 @@ type Engine struct {
 	defWatcher   *storage.Watcher
 	defDeleteSub messenger.Subscription
 	clock        clock
+
+	// Switch entities for scripts and automations (see entities.go).
+	fading      map[string]fadingVM // hash -> VM still running a graceful stop
+	bindings    map[string]binding  // entity key -> what it controls
+	defBindings map[string][]string // definition name -> its entity keys
+	cmdSub      messenger.Subscription
+	cmdQueue    chan func()
+	cmdDone     chan struct{}
 }
 
 type persistedInstance struct {
 	vm     *luaVM
+	rt     *activationRuntime
 	record scriptstore.Instance
 }
 
@@ -73,6 +82,8 @@ func newEngine(msg messenger.Messenger, store storage.Storage, logger logging.St
 		defTypes:    make(map[string]string),
 		instances:   make(map[string]*persistedInstance),
 		clock:       clk,
+		bindings:    make(map[string]binding),
+		defBindings: make(map[string][]string),
 	}
 
 	if err := e.ensureLayout(); err != nil {
@@ -95,6 +106,7 @@ func newEngine(msg messenger.Messenger, store storage.Storage, logger logging.St
 		}
 		e.definitions[def.Name] = def.Source
 		e.defTypes[def.Name] = def.Type
+		e.describeBindings(def.Name, def.Source)
 		if def.Type == "automation" {
 			automationNames = append(automationNames, def.Name)
 		}
@@ -121,11 +133,18 @@ func newEngine(msg messenger.Messenger, store storage.Storage, logger logging.St
 		e.mu.RLock()
 		_, running := e.instances[hash]
 		e.mu.RUnlock()
-		if !running {
+		if !running && e.automationEnabled(name) {
 			if err := e.startInstance(name, ""); err != nil {
 				slog.Warn("sb-script: auto-start automation error", "name", name, "err", err)
 			}
 		}
+	}
+
+	// Every switch entity now shows whether its instance runs.
+	e.syncAllEntities()
+	if err := e.startCommandReceiver(); err != nil {
+		e.Shutdown()
+		return nil, err
 	}
 
 	if err := e.startDefinitionWatcher(entries); err != nil {
@@ -175,6 +194,7 @@ func (e *Engine) StopScript(name, queryRef string) error {
 
 func (e *Engine) StopScriptWithTrace(name, queryRef, traceID string) error {
 	hash := scriptstore.HashInstance(name, queryRef)
+	e.cutFading(hash)
 	var vm *luaVM
 	e.mu.Lock()
 	if instVM, ok := e.instances[hash]; ok {
@@ -185,6 +205,7 @@ func (e *Engine) StopScriptWithTrace(name, queryRef, traceID string) error {
 	if vm != nil {
 		e.store.Delete(scriptstore.InstanceKey{Hash: hash})
 		go vm.close()
+		e.instanceStopped(name, queryRef)
 	}
 	e.appendLog("script.stop.requested", "info", "script stop requested", traceID, map[string]any{
 		"name":          name,
@@ -216,12 +237,18 @@ func (e *Engine) StopAllScriptsWithTrace(queryRef, traceID string) error {
 	for _, entry := range targetEntries {
 		targets[entry.Key] = struct{}{}
 	}
+	e.cutFadingOverlapping(targets)
 
 	instances, err := e.loadRunningInstances()
 	if err != nil {
 		return err
 	}
 	for _, inst := range instances {
+		// stopAll ends effect scripts on these targets. An automation that
+		// merely targets them (a mode's glue, a wall switch) keeps running.
+		if inst.QueryRef == "" && e.isAutomation(inst.Name) {
+			continue
+		}
 		instTargets, err := e.resolveInstanceTargets(inst)
 		if err != nil {
 			slog.Warn("sb-script: skip script during stop_all target resolution", "name", inst.Name, "hash", inst.Hash, "err", err)
@@ -246,6 +273,7 @@ func (e *Engine) StopAllScriptsWithTrace(queryRef, traceID string) error {
 }
 
 func (e *Engine) Shutdown() {
+	e.stopCommandReceiver()
 	if e.defWatcher != nil {
 		e.defWatcher.Stop()
 		e.defWatcher = nil
@@ -401,6 +429,7 @@ func (e *Engine) startInstance(name, queryRef string) error {
 	}
 
 	hash := scriptstore.HashInstance(name, queryRef)
+	e.cutFading(hash)
 	record := scriptstore.Instance{
 		Name:      name,
 		QueryRef:  queryRef,
@@ -419,7 +448,7 @@ func (e *Engine) startInstance(name, queryRef string) error {
 	// while no longer being listed or stoppable.
 	e.mu.Lock()
 	prev := e.instances[hash]
-	e.instances[hash] = &persistedInstance{vm: vm, record: record}
+	e.instances[hash] = &persistedInstance{vm: vm, rt: rt, record: record}
 	e.mu.Unlock()
 	if prev != nil && prev.vm != vm {
 		// Asynchronously, as StopScript does: this may run on prev's own goroutine,
@@ -431,6 +460,7 @@ func (e *Engine) startInstance(name, queryRef string) error {
 	// record too, from the VM goroutine; saving this one afterwards would
 	// overwrite its FireCount with zero.
 	saveErr := e.store.Save(record)
+	e.instanceStarted(name, queryRef, *record.StartedAt)
 
 	// Enqueue initial invocations AFTER the instance is registered so that
 	// markFired can find the record when these run on the VM goroutine.
@@ -490,23 +520,24 @@ func (e *Engine) reconcileDefinition(data json.RawMessage, _ *scriptstore.Defini
 	if hadPrev && prevSource == def.Source && prevType == def.Type {
 		return
 	}
+	// Restarting below writes the switch entities as instances start; any that
+	// end up not running are set off once at the end, never off-then-on.
+	defer e.syncDefinitionEntities(def.Name)
+	e.describeBindings(def.Name, def.Source)
 
 	runningRefs := e.stopInstancesForDefinition(def.Name)
 	switch def.Type {
 	case "automation":
-		if len(runningRefs) == 0 {
+		if !e.automationEnabled(def.Name) {
+			runningRefs = removeString(runningRefs, "")
+		} else if len(runningRefs) == 0 {
 			runningRefs = []string{""}
 		} else if !containsString(runningRefs, "") {
 			runningRefs = append([]string{""}, runningRefs...)
 		}
-	case "script":
-		if len(runningRefs) == 0 {
-			return
-		}
-	default:
-		if len(runningRefs) == 0 {
-			return
-		}
+	}
+	if len(runningRefs) == 0 {
+		return
 	}
 
 	for _, queryRef := range dedupeStrings(runningRefs) {
@@ -533,6 +564,7 @@ func (e *Engine) removeDefinitionByName(name string) {
 	delete(e.defTypes, name)
 	e.mu.Unlock()
 	e.stopInstancesForDefinition(name)
+	e.removeDefinitionEntities(name)
 }
 
 func (e *Engine) stopInstancesForDefinition(name string) []string {
@@ -560,6 +592,16 @@ func (e *Engine) stopInstancesForDefinition(name string) []string {
 		stop.vm.close()
 	}
 	return queryRefs
+}
+
+func removeString(items []string, drop string) []string {
+	out := items[:0:0]
+	for _, item := range items {
+		if item != drop {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func containsString(items []string, want string) bool {
@@ -712,6 +754,7 @@ type activationRuntime struct {
 	random             *rand.Rand
 	spec               automationSpec
 	scriptFn           *lua.LFunction
+	stopFn             *lua.LFunction // Script option: runs on a graceful stop
 	nextFireAt         *time.Time
 	initialInvocations []func() // enqueued after instance registration
 }
@@ -808,18 +851,33 @@ func (rt *activationRuntime) injectAutomationAPI() {
 
 	// Script registers a one-shot script: the function is called once when the
 	// instance is started and may use ctx.after for deferred work. Unlike
-	// Automation, Script has no trigger and is only started explicitly via
-	// ctx.scripts:start. Definitions with type="automation" use Automation;
-	// one-shot effect scripts use Script.
+	// Automation, Script has no trigger and is only started explicitly (its
+	// switch entity, ctx.scripts:start, or the API). An optional options table
+	// may come before the function:
+	//   Script(name, { scopes = {...}, stop = function(ctx) end }, fn)
+	// scopes names the saved queries offered as switches (read by the describe
+	// pass, see entities.go); stop runs when the switch is turned off.
 	L.SetGlobal("Script", L.NewFunction(func(L *lua.LState) int {
 		name := L.CheckString(1)
-		fn := L.CheckFunction(2)
+		var fn *lua.LFunction
+		var opts *lua.LTable
+		if tbl, ok := L.Get(2).(*lua.LTable); ok {
+			opts = tbl
+			fn = L.CheckFunction(3)
+		} else {
+			fn = L.CheckFunction(2)
+		}
 		if name != rt.name {
 			return 0
 		}
 		spec := automationSpec{targets: targetSpec{kind: "none"}}
 		if rt.queryOverride != nil {
 			spec.targets = targetSpec{kind: "query_ref", queryRef: rt.queryRef, query: *rt.queryOverride}
+		}
+		if opts != nil {
+			if stop, ok := L.GetField(opts, "stop").(*lua.LFunction); ok {
+				rt.stopFn = stop
+			}
 		}
 		rt.spec = spec
 		rt.scriptFn = fn
@@ -1311,6 +1369,7 @@ func (rt *activationRuntime) markError(err error) {
 	rt.engine.saveInstanceRecord(rt.instanceHash(), func(inst *scriptstore.Instance) {
 		inst.LastError = err.Error()
 	})
+	rt.engine.instanceFailed(rt.name, rt.queryRef, err.Error())
 }
 
 func triggerInfo(spec triggerSpec) scriptstore.TriggerInfo {

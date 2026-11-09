@@ -49,6 +49,24 @@ func APIReferenceDoc() APIReference {
 				},
 			},
 			{
+				Name:      "Script",
+				Kind:      "global",
+				Signature: "Script(name, [options], fn)",
+				Description: "Defines a script: fn runs once when an instance starts and may keep working with ctx.after. " +
+					"An instance is the script plus a scope (a saved query, its ctx.targets). Each declared scope gets a switch entity " +
+					"sb-script.script-<name>.<scope> (no scopes: sb-script.script-<name>.run) that is on while that instance runs; " +
+					"switch_turn_on starts it, switch_turn_off stops it gracefully. Automations get sb-script.automation-<name>.enabled; " +
+					"turning it off keeps the automation stopped across restarts.",
+				Params: []ParamDoc{
+					{Name: "name", Type: "string", Description: "Definition name for this script.", Required: true},
+					{Name: "options", Type: "table", Description: "Optional.", Fields: []ParamDoc{
+						{Name: "scopes", Type: "string[]", Description: "Saved query names offered as switches, one entity each."},
+						{Name: "stop", Type: "function(ctx)", Description: "Runs when the switch is turned off, with the instance's targets; may use ctx.after (up to 60 s). Not run by ctx.scripts:stop, stopAll or the stop API, which stop at once."},
+					}},
+					{Name: "fn", Type: "function(ctx)", Description: "Runs once when the instance starts.", Required: true},
+				},
+			},
+			{
 				Name:        "Entity",
 				Kind:        "global",
 				Signature:   "Entity(key)",

@@ -23,6 +23,18 @@ Defines the entrypoint for one automation activation. The name must match the sa
 - `cmd/sb-script/features/party_time.lua`
 - `cmd/sb-script/features/motion_lights.lua`
 
+### `Script(name, [options], fn)`
+
+Defines a script: fn runs once when an instance starts and may keep working with ctx.after. An instance is the script plus a scope (a saved query, its ctx.targets). Each declared scope gets a switch entity sb-script.script-<name>.<scope> (no scopes: sb-script.script-<name>.run) that is on while that instance runs; switch_turn_on starts it, switch_turn_off stops it gracefully. Automations get sb-script.automation-<name>.enabled; turning it off keeps the automation stopped across restarts.
+
+**Parameters**
+
+- `name` `string`: Definition name for this script.
+- `options` `table`: Optional.
+  - `scopes` `string[]`: Saved query names offered as switches, one entity each.
+  - `stop` `function(ctx)`: Runs when the switch is turned off, with the instance's targets; may use ctx.after (up to 60 s). Not run by ctx.scripts:stop, stopAll or the stop API, which stop at once.
+- `fn` `function(ctx)`: Runs once when the instance starts.
+
 ### `Entity(key)`
 
 Creates an entity trigger or target spec that matches one exact entity key.
@@ -39,11 +51,11 @@ Creates an entity trigger or target spec that matches one exact entity key.
 
 ### `Query(query)`
 
-Creates a query-backed trigger or target spec. Queries are re-resolved at fire time.
+Creates an inline query-backed trigger or target spec. Queries are re-resolved at fire time.
 
 **Parameters**
 
-- `query` `string`: Storage search key pattern or filter query.
+- `query` `string|table`: Storage search key pattern or structured query object.
 
 **Returns**: `TriggerSpec|TargetSpec`
 
@@ -51,6 +63,20 @@ Creates a query-backed trigger or target spec. Queries are re-resolved at fire t
 
 - `cmd/sb-script/features/motion_lights.lua`
 - `cmd/sb-script/features/party_time.lua`
+
+### `QueryRef(name)`
+
+Creates a query-backed trigger or target spec from a named storage query resource.
+
+**Parameters**
+
+- `name` `string`: Stored query name under sb-query.queries.{name}.
+
+**Returns**: `TriggerSpec|TargetSpec`
+
+**Examples**
+
+- `targets = QueryRef("rgb_lights")`
 
 ### `None()`
 
@@ -88,6 +114,15 @@ Iterates the current target entities for the activation firing.
 
 - `fn` `function(entity)`: Called for each target entity.
 
+### `ctx.decision(label, data)`
+
+Appends a structured decision/branch event to the automation log stream for the current trace.
+
+**Parameters**
+
+- `label` `string`: Short branch/decision label such as any_on_true or ignored_falling_edge.
+- `data` `table`: Optional JSON-serializable fields explaining the decision.
+
 ### `ctx.send(entity, action, payload)`
 
 Publishes a command subject for the given entity.
@@ -104,7 +139,7 @@ Resolves entities from storage inside the callback.
 
 **Parameters**
 
-- `query` `string`: Storage search key pattern or filter query.
+- `query` `string|table`: Storage search key pattern or structured query object.
 
 **Returns**: `entities`
 
@@ -114,7 +149,7 @@ Returns the first entity matching the query or nil.
 
 **Parameters**
 
-- `query` `string`: Storage search key pattern or filter query.
+- `query` `string|table`: Storage search key pattern or structured query object.
 
 **Returns**: `entity|nil`
 
@@ -156,6 +191,32 @@ Cancels a timer created by ctx.after or ctx.every.
 
 - `timer_id` `number`: Timer identifier previously returned by ctx.after or ctx.every.
 
+### `ctx.scripts:start(name, queryRef | {queryRef=...})`
+
+Starts another stored script definition through the normal runtime contract.
+
+**Parameters**
+
+- `name` `string`: Stored script definition name.
+- `queryRef` `string|table`: Optional query ref string or table containing queryRef.
+
+### `ctx.scripts:stop(name, queryRef | {queryRef=...})`
+
+Stops a running script instance through the normal runtime contract.
+
+**Parameters**
+
+- `name` `string`: Stored script definition name.
+- `queryRef` `string|table`: Optional query ref string or table containing queryRef.
+
+### `ctx.scripts:stopAll(queryRef | {queryRef=...})`
+
+Stops all running script instances whose targets overlap with the given query ref.
+
+**Parameters**
+
+- `queryRef` `string|table`: Query ref string or table containing queryRef.
+
 ## Example Scripts
 
 ### `adaptive_evening_lighting.lua`
@@ -190,6 +251,25 @@ Automation("adaptive_evening_lighting", {
     else
       ctx.send(e, "light_set_brightness", {brightness=160})
     end
+  end)
+end)
+```
+
+### `alarm_snooze_isolation.lua`
+
+```lua
+local count = 0
+
+Automation("alarm_snooze_isolation", {
+  trigger = Entity("test.multi.alarm"),
+  targets = None(),
+}, function(ctx)
+  if ctx.trigger.entity.state.value ~= "ringing" then
+    return
+  end
+  count = count + 1
+  ctx.targets:each(function(e)
+    ctx.send(e, "text_set_value", {value=tostring(count)})
   end)
 end)
 ```
@@ -252,21 +332,49 @@ Automation("doorbell", {
 end)
 ```
 
+### `doorbell_cooldown_isolation.lua`
+
+```lua
+local cooling = false
+
+Automation("doorbell_cooldown_isolation", {
+  trigger = Entity("test.multi.doorbell"),
+  targets = None(),
+}, function(ctx)
+  if ctx.trigger.entity.state.presses <= 0 then
+    return
+  end
+  if cooling then
+    return
+  end
+  cooling = true
+  ctx.targets:each(function(e)
+    ctx.send(e, "light_turn_on", {})
+  end)
+  ctx.after(0.25, function()
+    cooling = false
+  end)
+end)
+```
+
 ### `fade_down.lua`
 
 ```lua
 local timers = {}
 local active = false
+local generation = 0
 
 Automation("fade_down", {
   trigger = Entity("test.remote.fadedown"),
   targets = Query("test.lr.>"),
 }, function(ctx)
   if ctx.trigger.entity.state.on then
+    generation = generation + 1
     active = true
+    local token = generation
     timers[1] = ctx.after(0.05, function(step)
       timers[2] = step.every(0.05, function(tick)
-        if active then
+        if active and token == generation then
           tick.targets:each(function(e)
             tick.send(e, "light_step_brightness", {delta=-1})
           end)
@@ -275,7 +383,7 @@ Automation("fade_down", {
     end)
     timers[3] = ctx.after(0.10, function(step)
       timers[4] = step.every(0.05, function(tick)
-        if active then
+        if active and token == generation then
           tick.targets:each(function(e)
             tick.send(e, "light_step_brightness", {delta=-5})
           end)
@@ -284,7 +392,7 @@ Automation("fade_down", {
     end)
     timers[5] = ctx.after(0.50, function(step)
       timers[6] = step.every(0.05, function(tick)
-        if active then
+        if active and token == generation then
           tick.targets:each(function(e)
             tick.send(e, "light_step_brightness", {delta=-1})
           end)
@@ -292,6 +400,7 @@ Automation("fade_down", {
       end)
     end)
   else
+    generation = generation + 1
     active = false
     for i = 1, #timers do
       ctx.cancel(timers[i])
@@ -306,16 +415,19 @@ end)
 ```lua
 local timers = {}
 local active = false
+local generation = 0
 
 Automation("fade_up", {
   trigger = Entity("test.remote.fadeup"),
   targets = Query("test.lr.>"),
 }, function(ctx)
   if ctx.trigger.entity.state.on then
+    generation = generation + 1
     active = true
+    local token = generation
     timers[1] = ctx.after(0.05, function(step)
       timers[2] = step.every(0.05, function(tick)
-        if active then
+        if active and token == generation then
           tick.targets:each(function(e)
             tick.send(e, "light_step_brightness", {delta=1})
           end)
@@ -324,7 +436,7 @@ Automation("fade_up", {
     end)
     timers[3] = ctx.after(0.10, function(step)
       timers[4] = step.every(0.05, function(tick)
-        if active then
+        if active and token == generation then
           tick.targets:each(function(e)
             tick.send(e, "light_step_brightness", {delta=5})
           end)
@@ -333,7 +445,7 @@ Automation("fade_up", {
     end)
     timers[5] = ctx.after(0.50, function(step)
       timers[6] = step.every(0.05, function(tick)
-        if active then
+        if active and token == generation then
           tick.targets:each(function(e)
             tick.send(e, "light_step_brightness", {delta=1})
           end)
@@ -341,6 +453,7 @@ Automation("fade_up", {
       end)
     end)
   else
+    generation = generation + 1
     active = false
     for i = 1, #timers do
       ctx.cancel(timers[i])
@@ -370,6 +483,89 @@ Automation("garage_safety_close", {
       step.send(step.queryOne("test.garage.cover001"), "cover_close", {})
     end
   end)
+end)
+```
+
+### `lightstrip_rainbow.lua`
+
+```lua
+local offset = 0
+local palette = {
+  {255, 128, 0},
+  {255, 255, 0},
+  {0, 255, 0},
+  {0, 0, 255},
+  {128, 0, 255},
+  {255, 0, 0},
+}
+
+local function rainbow_segments(count, drift)
+  local segments = {}
+  for i = 1, count do
+    local idx = ((i - 1 + drift) % #palette) + 1
+    local color = palette[idx]
+    segments[i] = {
+      id = i,
+      rgb = {color[1], color[2], color[3]},
+      brightness = 180,
+    }
+  end
+  return segments
+end
+
+Automation("lightstrip_rainbow", {
+  trigger = Interval(0.05),
+  targets = Query({
+    where = {
+      { field = "type", op = "eq", value = "lightstrip" },
+    },
+  }),
+}, function(ctx)
+  offset = (offset + 1) % #palette
+  ctx.targets:each(function(strip)
+    ctx.send(strip, "lightstrip_set_segments", {
+      power = true,
+      colorMode = "rgb",
+      effect = "rainbow_drift",
+      effectSpeed = 10,
+      segments = rainbow_segments(4, offset),
+    })
+  end)
+end)
+```
+
+### `manual_dimmer_hold_isolation.lua`
+
+```lua
+local phase = 0
+local timers = {}
+local active = false
+
+Automation("manual_dimmer_hold_isolation", {
+  trigger = Entity("test.multi.dim_up"),
+  targets = None(),
+}, function(ctx)
+  if ctx.trigger.entity.state.on then
+    active = true
+    phase = phase + 1
+    local delta = 1
+    if phase >= 2 then
+      delta = 5
+    end
+    timers[1] = ctx.after(0.05, function(step)
+      if active then
+        step.targets:each(function(e)
+          step.send(e, "light_step_brightness", {delta=delta})
+        end)
+      end
+    end)
+  else
+    active = false
+    for i = 1, #timers do
+      ctx.cancel(timers[i])
+    end
+    timers = {}
+  end
 end)
 ```
 
@@ -425,7 +621,12 @@ end)
 local off_timer = nil
 
 Automation("occupancy_timeout", {
-  trigger = Query("?type=binary_sensor state.deviceClass=motion"),
+  trigger = Query({
+    where = {
+      { field = "type", op = "eq", value = "binary_sensor" },
+      { field = "state.deviceClass", op = "eq", value = "motion" },
+    },
+  }),
   targets = Query("test.hall.>"),
 }, function(ctx)
   if ctx.trigger.entity.state.on then
@@ -454,6 +655,48 @@ Automation("occupancy_timeout", {
 end)
 ```
 
+### `occupancy_timeout_isolation.lua`
+
+```lua
+local pending = false
+local timer = nil
+
+Automation("occupancy_timeout_isolation", {
+  trigger = Entity("test.multi.motion_sensor"),
+  targets = None(),
+}, function(ctx)
+  if ctx.trigger.entity.state.on then
+    if pending and timer then
+      ctx.cancel(timer)
+      ctx.targets:each(function(e)
+        ctx.send(e, "text_set_value", {value="cancelled"})
+      end)
+    else
+      ctx.targets:each(function(e)
+        ctx.send(e, "text_set_value", {value="idle_on"})
+      end)
+    end
+    pending = false
+    timer = nil
+    return
+  end
+
+  pending = true
+  ctx.targets:each(function(e)
+    ctx.send(e, "text_set_value", {value="pending"})
+  end)
+  timer = ctx.after(0.15, function(step)
+    if pending then
+      step.targets:each(function(e)
+        step.send(e, "text_set_value", {value="expired"})
+      end)
+    end
+    pending = false
+    timer = nil
+  end)
+end)
+```
+
 ### `party_time.lua`
 
 ```lua
@@ -465,6 +708,33 @@ Automation("party_time", {
     if e.state.colorMode == "rgb" then
       ctx.send(e, "light_set_rgb", {r=255, g=0, b=255})
     end
+  end)
+end)
+```
+
+### `presence_arrival_isolation.lua`
+
+```lua
+local greeted = false
+
+Automation("presence_arrival_isolation", {
+  trigger = Entity("test.multi.presence"),
+  targets = None(),
+}, function(ctx)
+  local value = ctx.trigger.entity.state.value
+  if value == "away" then
+    greeted = false
+    return
+  end
+  if value ~= "arrived" then
+    return
+  end
+  if greeted then
+    return
+  end
+  greeted = true
+  ctx.targets:each(function(e)
+    ctx.send(e, "light_turn_on", {})
   end)
 end)
 ```
@@ -539,6 +809,31 @@ Automation("scene_cycler_button", {
     if e.type == "light" then
       ctx.send(e, "light_set_rgb", scene)
     end
+  end)
+end)
+```
+
+### `scene_cycler_isolation.lua`
+
+```lua
+local index = 0
+local scenes = {
+  {r=255, g=0, b=0},
+  {r=0, g=255, b=0},
+  {r=0, g=0, b=255},
+}
+
+Automation("scene_cycler_isolation", {
+  trigger = Entity("test.multi.scene_button"),
+  targets = None(),
+}, function(ctx)
+  if ctx.trigger.entity.state.presses <= 0 then
+    return
+  end
+  index = (index % #scenes) + 1
+  local scene = scenes[index]
+  ctx.targets:each(function(e)
+    ctx.send(e, "light_set_rgb", scene)
   end)
 end)
 ```
