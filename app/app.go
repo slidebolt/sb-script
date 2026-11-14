@@ -30,6 +30,7 @@ func (a *App) Hello() contract.HelloResponse {
 		Kind:            contract.KindPlugin,
 		ContractVersion: contract.ContractVersion,
 		DependsOn:       []string{"messenger", "storage"},
+		Definitions:     contract.DescribePlugin("Script Engine", "Runs scripts and recurring automations and exposes their enabled or running state as shared switches.", "switch"),
 	}
 }
 

@@ -10,4 +10,7 @@ func TestHelloManifest(t *testing.T) {
 	if len(h.DependsOn) != 2 || h.DependsOn[0] != "messenger" || h.DependsOn[1] != "storage" {
 		t.Fatalf("dependsOn: got %v want [messenger storage]", h.DependsOn)
 	}
+	if err := h.Validate(); err != nil {
+		t.Fatalf("manifest validation: %v", err)
+	}
 }
