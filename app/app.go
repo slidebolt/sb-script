@@ -31,6 +31,7 @@ func (a *App) Hello() contract.HelloResponse {
 		ContractVersion: contract.ContractVersion,
 		DependsOn:       []string{"messenger", "storage"},
 		Definitions:     contract.DescribePlugin("Script Engine", "Runs scripts and recurring automations and exposes their enabled or running state as shared switches.", "switch"),
+		Setup:           contract.RequiredSetup("Core"),
 	}
 }
 
