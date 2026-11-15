@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1057,6 +1058,62 @@ func TestScriptDefinition_DoesNotAutoStart(t *testing.T) {
 		if json.Unmarshal(entry.Data, &inst) == nil && inst.Hash == hash {
 			t.Fatal("Script definition should not auto-start, but found a running instance")
 		}
+	}
+}
+
+func TestQueryTrigger_ManyPreExistingEntitiesDoesNotDeadlockStartup(t *testing.T) {
+	msg, err := messenger.Mock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Close()
+
+	store, err := storageserver.Mock(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	for i := 0; i < 100; i++ {
+		if err := store.Save(domain.Entity{
+			ID:       fmt.Sprintf("switch-%03d", i),
+			Plugin:   "source",
+			DeviceID: "existing",
+			Type:     "switch",
+			Name:     "Existing switch",
+			State:    domain.Switch{Power: true},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	source := `Automation("ManyExisting", {
+		trigger = Query({ pattern = "source.>" }),
+		targets = None()
+	}, function(ctx)
+	end)`
+	if err := saveAutomation(t, store, "ManyExisting", source); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan *Engine, 1)
+	errs := make(chan error, 1)
+	go func() {
+		engine, err := New(msg, store)
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- engine
+	}()
+
+	select {
+	case engine := <-done:
+		engine.Shutdown()
+	case err := <-errs:
+		t.Fatal(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine startup deadlocked while enqueuing existing query matches")
 	}
 }
 

@@ -464,6 +464,12 @@ func (e *Engine) startInstance(name, queryRef string) error {
 
 	// Enqueue initial invocations AFTER the instance is registered so that
 	// markFired can find the record when these run on the VM goroutine.
+	// Initial triggers run outside the VM goroutine because they enqueue their
+	// callback onto that same VM. Running them from inside the VM can deadlock
+	// once a query matches more entries than the queue can hold.
+	for _, trigger := range rt.initialTriggers {
+		trigger()
+	}
 	for _, fn := range rt.initialInvocations {
 		vm.enqueue(fn)
 	}
@@ -757,6 +763,7 @@ type activationRuntime struct {
 	stopFn             *lua.LFunction // Script option: runs on a graceful stop
 	nextFireAt         *time.Time
 	initialInvocations []func() // enqueued after instance registration
+	initialTriggers    []func() // run after registration; each enqueues its callback
 }
 
 func (rt *activationRuntime) injectAutomationAPI() {
@@ -1030,7 +1037,7 @@ func (rt *activationRuntime) activate(spec automationSpec, fn *lua.LFunction) {
 				for _, entry := range entries {
 					data := entry.Data
 					// Defer to after instance registration so markFired can find the record.
-					rt.initialInvocations = append(rt.initialInvocations, func() {
+					rt.initialTriggers = append(rt.initialTriggers, func() {
 						invokeEntity("", data)
 					})
 				}
